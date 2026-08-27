@@ -111,6 +111,48 @@ final class PullRequestDecodingTests: XCTestCase {
         XCTAssertEqual(decoded.first, original)
     }
 
+    // MARK: - author
+
+    /// Confirmed live (`gh search prs --json author`, gh 2.98.0): an object
+    /// with `login`, `id`, `is_bot`, `type`, `url`. Only `login` is consumed.
+    func testDecodesAuthorLogin() throws {
+        let json = """
+        [{
+          "number": 1,
+          "repository": { "nameWithOwner": "a/b" },
+          "url": "https://github.com/a/b/pull/1",
+          "author": { "login": "dependabot[bot]", "is_bot": true }
+        }]
+        """
+        XCTAssertEqual(try decode(json)[0].authorLogin, "dependabot[bot]")
+    }
+
+    /// Fixtures (and any real payload predating this field) omit `author`
+    /// entirely; decoding must not throw or fabricate a value.
+    func testMissingAuthorDecodesToNil() throws {
+        let json = """
+        [{
+          "number": 1,
+          "repository": { "nameWithOwner": "a/b" },
+          "url": "https://github.com/a/b/pull/1"
+        }]
+        """
+        XCTAssertNil(try decode(json)[0].authorLogin)
+    }
+
+    func testAuthorRoundTripsThroughEncoding() throws {
+        let original = PullRequest(
+            repo: "a/b",
+            number: 5,
+            title: "Round trip",
+            url: "https://github.com/a/b/pull/5",
+            authorLogin: "dependabot[bot]"
+        )
+        let data = try JSONEncoder().encode([original])
+        let decoded = try JSONDecoder().decode([PullRequest].self, from: data)
+        XCTAssertEqual(decoded.first?.authorLogin, "dependabot[bot]")
+    }
+
     // MARK: - stderr condensing
 
     func testCondenseDropsUpdateNotifierNoise() {

@@ -113,6 +113,17 @@ public final class PRStore: ObservableObject {
                 self?.recomputeSections()
             }
             .store(in: &cancellables)
+
+        // Same reasoning as staleness: a pure display filter over already-
+        // fetched raw results (author is decoded alongside the rest), so it
+        // recomputes locally instead of re-hitting the API.
+        settings.$ignoredAuthors
+            .dropFirst()
+            .debounce(for: .milliseconds(400), scheduler: RunLoop.main)
+            .sink { [weak self] _ in
+                self?.recomputeSections()
+            }
+            .store(in: &cancellables)
     }
 
     // MARK: - Refresh
@@ -218,7 +229,8 @@ public final class PRStore: ObservableObject {
             authoredRaw: lastRawAuthored,
             whitelist: settings.repoWhitelist,
             ignoreWhitelistForOwnPRs: settings.ignoreWhitelistForOwnPRs,
-            ignoreOlderThan: settings.ignoreOlderThanCutoff
+            ignoreOlderThan: settings.ignoreOlderThanCutoff,
+            ignoredAuthors: settings.ignoredAuthors
         )
     }
 

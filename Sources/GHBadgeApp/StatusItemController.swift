@@ -18,6 +18,15 @@ final class StatusItemController {
     private let store: PRStore
     private let onOpenSettings: () -> Void
 
+    /// Global+local mouseDown monitors that force-close the popover on an
+    /// outside click. `.transient` alone is unreliable for status-item
+    /// popovers in `LSUIElement` apps (accessory apps never become key/active,
+    /// which is what AppKit's built-in transient dismissal leans on), so this
+    /// closes explicitly instead of trusting it. Left installed between an
+    /// AppKit-internal dismissal (e.g. Escape) and the next open/close, which
+    /// is harmless: `closePopoverIfShown` no-ops once the popover isn't shown.
+    private var outsideClickMonitors: [Any] = []
+
     private var cancellables = Set<AnyCancellable>()
 
     init(store: PRStore, settings: SettingsStore, onOpenSettings: @escaping () -> Void) {
@@ -98,9 +107,58 @@ final class StatusItemController {
     private func togglePopover() {
         if popover.isShown {
             popover.performClose(nil)
+            removeOutsideClickMonitors()
         } else if let button = statusItem.button {
             popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
+            installOutsideClickMonitors()
         }
+    }
+
+    /// Closes the popover on the next mouseDown anywhere outside its window.
+    /// A global monitor covers clicks in other apps and on the desktop; a
+    /// local monitor covers clicks in this app's own windows (e.g. the
+    /// Settings window), which the global monitor never sees. Both exclude
+    /// clicks on the status item button itself: without that, a mouseDown on
+    /// the button would force-close the popover before the button's own
+    /// mouseUp action runs `togglePopover()`, which would then see it already
+    /// closed and reopen it — turning a single click-to-close into a flicker.
+    private func installOutsideClickMonitors() {
+        removeOutsideClickMonitors()
+
+        let global = NSEvent.addGlobalMonitorForEvents(matching: [.leftMouseDown, .rightMouseDown]) { [weak self] _ in
+            guard let self, !self.isClickOnStatusButton(NSEvent.mouseLocation) else { return }
+            self.closePopoverIfShown()
+        }
+        let local = NSEvent.addLocalMonitorForEvents(matching: [.leftMouseDown, .rightMouseDown]) { [weak self] event in
+            guard let self, let popoverWindow = self.popover.contentViewController?.view.window else {
+                return event
+            }
+            if event.window !== popoverWindow && !self.isClickOnStatusButton(NSEvent.mouseLocation) {
+                self.closePopoverIfShown()
+            }
+            return event
+        }
+
+        if let global { outsideClickMonitors.append(global) }
+        if let local { outsideClickMonitors.append(local) }
+    }
+
+    /// `screenPoint` is in screen coordinates, matching `NSEvent.mouseLocation`.
+    private func isClickOnStatusButton(_ screenPoint: NSPoint) -> Bool {
+        guard let button = statusItem.button, let window = button.window else { return false }
+        let frameInScreen = window.convertToScreen(button.convert(button.bounds, to: nil))
+        return frameInScreen.contains(screenPoint)
+    }
+
+    private func removeOutsideClickMonitors() {
+        outsideClickMonitors.forEach(NSEvent.removeMonitor)
+        outsideClickMonitors.removeAll()
+    }
+
+    private func closePopoverIfShown() {
+        guard popover.isShown else { return }
+        popover.performClose(nil)
+        removeOutsideClickMonitors()
     }
 
     // MARK: - Menu actions

@@ -26,10 +26,15 @@ public final class SettingsStore: ObservableObject {
         public static let ignoreOlderThanEnabled = "ignoreOlderThanEnabled"
         public static let ignoreOlderThanValue = "ignoreOlderThanValue"
         public static let ignoreOlderThanUnit = "ignoreOlderThanUnit"
+        public static let ignoredAuthors = "ignoredAuthors"
     }
 
     public static let refreshIntervalOptions = [60, 120, 300, 600]
     public static let defaultRefreshInterval = 300
+
+    /// Seeded on first run only: an explicit empty list (the user removed
+    /// every entry) is respected and never re-seeded.
+    public static let defaultIgnoredAuthors = ["dependabot[bot]"]
 
     private let defaults: UserDefaults
     private var isLoading = false
@@ -82,6 +87,13 @@ public final class SettingsStore: ObservableObject {
         didSet { persist(launchAtLogin, Key.launchAtLogin) }
     }
 
+    /// Logins to hide from the review sections (e.g. "dependabot[bot]").
+    /// Defaults to dependabot on first run; an explicit empty list persists
+    /// as empty rather than re-seeding.
+    @Published public var ignoredAuthors: [String] = SettingsStore.defaultIgnoredAuthors {
+        didSet { persist(ignoredAuthors, Key.ignoredAuthors) }
+    }
+
     @Published public var refreshIntervalSeconds: Int = SettingsStore.defaultRefreshInterval {
         didSet { persist(refreshIntervalSeconds, Key.refreshIntervalSeconds) }
     }
@@ -107,6 +119,7 @@ public final class SettingsStore: ObservableObject {
         ignoreOlderThanValue = storedAmount >= 1 ? storedAmount : 1
         ignoreOlderThanUnitRaw = defaults.string(forKey: Key.ignoreOlderThanUnit)
             ?? StalenessUnit.days.rawValue
+        ignoredAuthors = defaults.stringArray(forKey: Key.ignoredAuthors) ?? Self.defaultIgnoredAuthors
         isLoading = false
     }
 
@@ -146,6 +159,16 @@ public final class SettingsStore: ObservableObject {
         normalizeRepo(raw)
     }
 
+    /// A GitHub login, e.g. "dependabot[bot]" or "alice". Looser than
+    /// `normalizeRepo`: bot logins carry `[bot]`, which the repo/team charset
+    /// rejects. Only trims and rejects the empty/slash-containing cases that
+    /// are clearly not a login.
+    public nonisolated static func normalizeAuthor(_ raw: String) -> String? {
+        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty, !trimmed.contains("/") else { return nil }
+        return trimmed
+    }
+
     /// Returns false when the entry is invalid or already present.
     @discardableResult
     public func addRepo(_ raw: String) -> Bool {
@@ -173,6 +196,21 @@ public final class SettingsStore: ObservableObject {
 
     public func removeTeams(_ toRemove: Set<String>) {
         teams.removeAll { toRemove.contains($0) }
+    }
+
+    /// Returns false when the entry is invalid or already present.
+    @discardableResult
+    public func addAuthor(_ raw: String) -> Bool {
+        guard let author = Self.normalizeAuthor(raw) else { return false }
+        guard !ignoredAuthors.contains(where: { $0.caseInsensitiveCompare(author) == .orderedSame }) else {
+            return false
+        }
+        ignoredAuthors.append(author)
+        return true
+    }
+
+    public func removeAuthors(_ authors: Set<String>) {
+        ignoredAuthors.removeAll { authors.contains($0) }
     }
 
     // MARK: - Derived

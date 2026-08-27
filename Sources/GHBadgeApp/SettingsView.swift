@@ -50,6 +50,22 @@ struct SettingsView: View {
             }
 
             Section {
+                TokenListEditor(
+                    entries: settings.ignoredAuthors,
+                    placeholder: "login (e.g. dependabot[bot])",
+                    invalidMessage: "Enter a GitHub username or bot login.",
+                    onAdd: { settings.addAuthor($0) },
+                    onRemove: { settings.removeAuthors($0) }
+                )
+            } header: {
+                Text("Ignored authors")
+            } footer: {
+                Text("PRs authored by these logins are hidden from the review sections. Doesn't affect My Open PRs.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+
+            Section {
                 Toggle("Ignore PRs older than", isOn: $settings.ignoreOlderThanEnabled)
 
                 if settings.ignoreOlderThanEnabled {

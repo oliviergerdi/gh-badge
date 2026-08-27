@@ -33,15 +33,20 @@ public enum PRSectioning {
     ///   - whitelist: "owner/repo" entries; empty means the review sections stay empty.
     ///   - ignoreWhitelistForOwnPRs: when true, `myOpenPRs` is not whitelist-filtered.
     ///   - cutoff: when non-nil, PRs whose `updatedAt` predates it are hidden.
+    ///   - ignoredAuthors: logins to hide from the review sections only (e.g.
+    ///     "dependabot[bot]"); `myOpenPRs` is always PRs you authored, so this
+    ///     list has nothing to say about it.
     public static func sections(
         needsReviewRaw: [PullRequest],
         reviewedByRaw: [PullRequest],
         authoredRaw: [PullRequest],
         whitelist: [String],
         ignoreWhitelistForOwnPRs: Bool,
-        ignoreOlderThan cutoff: Date? = nil
+        ignoreOlderThan cutoff: Date? = nil,
+        ignoredAuthors: [String] = []
     ) -> PRSections {
         let allowed = Set(whitelist.map { $0.lowercased() })
+        let ignored = Set(ignoredAuthors.map { $0.lowercased() })
 
         func permitted(_ pr: PullRequest) -> Bool {
             allowed.contains(pr.repo.lowercased())
@@ -55,12 +60,19 @@ public enum PRSectioning {
             return pr.updatedAt.map { $0 >= cutoff } ?? true
         }
 
+        // Same "missing data, don't hide" rule as `recent`: an unknown author
+        // can't be proven to match the ignore list.
+        func notIgnored(_ pr: PullRequest) -> Bool {
+            guard let author = pr.authorLogin else { return true }
+            return !ignored.contains(author.lowercased())
+        }
+
         // You can't review your own PR, so an authored PR never belongs in
         // "needs review" even when a team you're in was requested.
         let authoredURLs = Set(dedupe(authoredRaw).map(\.url))
 
         let needsReview = dedupe(needsReviewRaw)
-            .filter { permitted($0) && !authoredURLs.contains($0.url) && recent($0) }
+            .filter { permitted($0) && !authoredURLs.contains($0.url) && recent($0) && notIgnored($0) }
             .sorted(by: PullRequest.byRecency)
 
         // A re-requested review wins: if a PR appears in both, it belongs only
@@ -68,7 +80,7 @@ public enum PRSectioning {
         let needsReviewURLs = Set(needsReview.map(\.url))
 
         let alreadyReviewed = dedupe(reviewedByRaw)
-            .filter { permitted($0) && !needsReviewURLs.contains($0.url) && recent($0) }
+            .filter { permitted($0) && !needsReviewURLs.contains($0.url) && recent($0) && notIgnored($0) }
             .sorted(by: PullRequest.byRecency)
 
         let mine = dedupe(authoredRaw)
