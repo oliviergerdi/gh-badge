@@ -1,6 +1,6 @@
 import Foundation
 
-/// A pull request as returned by `gh search prs --json repository,number,title,url,updatedAt,state`.
+/// A pull request as returned by `gh search prs --json repository,number,title,url,updatedAt,state,author`.
 ///
 /// The `repository` value is confirmed (live `gh` 2.98.0) to be an object with
 /// `name` and `nameWithOwner`; only the latter is consumed. Decoding fails
@@ -18,13 +18,19 @@ public struct PullRequest: Identifiable, Hashable, Codable, Sendable {
     public let updatedAt: Date?
     public let state: String
 
+    /// The PR author's login, e.g. "dependabot[bot]". Optional: fixtures and
+    /// any payload predating this field omit it, and decoding must not
+    /// fabricate a value in that case.
+    public let authorLogin: String?
+
     public init(
         repo: String,
         number: Int,
         title: String,
         url: String,
         updatedAt: Date? = nil,
-        state: String = "open"
+        state: String = "open",
+        authorLogin: String? = nil
     ) {
         self.repo = repo
         self.number = number
@@ -32,6 +38,7 @@ public struct PullRequest: Identifiable, Hashable, Codable, Sendable {
         self.url = url
         self.updatedAt = updatedAt
         self.state = state
+        self.authorLogin = authorLogin
     }
 
     /// Just the repository name, without the owner. Used in the dropdown, where
@@ -48,7 +55,7 @@ public struct PullRequest: Identifiable, Hashable, Codable, Sendable {
     // MARK: - Decoding
 
     private enum CodingKeys: String, CodingKey {
-        case repository, number, title, url, updatedAt, state
+        case repository, number, title, url, updatedAt, state, author
     }
 
     public init(from decoder: Decoder) throws {
@@ -64,6 +71,15 @@ public struct PullRequest: Identifiable, Hashable, Codable, Sendable {
 
         self.updatedAt = try c.decodeIfPresent(String.self, forKey: .updatedAt)
             .flatMap(PullRequest.parseTimestamp)
+
+        // `try?`, not `decodeIfPresent`: an `author` key whose value is present
+        // but missing `login` (or a shape we don't expect) should degrade to
+        // nil rather than throw, same tolerance as a wholly absent key.
+        if let authorContainer = try? c.nestedContainer(keyedBy: AuthorKeys.self, forKey: .author) {
+            self.authorLogin = try? authorContainer.decode(String.self, forKey: .login)
+        } else {
+            self.authorLogin = nil
+        }
     }
 
     public func encode(to encoder: Encoder) throws {
@@ -77,6 +93,10 @@ public struct PullRequest: Identifiable, Hashable, Codable, Sendable {
         if let updatedAt {
             try c.encode(PullRequest.formatTimestamp(updatedAt), forKey: .updatedAt)
         }
+        if let authorLogin {
+            var authorContainer = c.nestedContainer(keyedBy: AuthorKeys.self, forKey: .author)
+            try authorContainer.encode(authorLogin, forKey: .login)
+        }
     }
 
     // MARK: - Repository
@@ -85,6 +105,12 @@ public struct PullRequest: Identifiable, Hashable, Codable, Sendable {
     /// with `name` and `nameWithOwner`. Only `nameWithOwner` is consumed.
     private enum RepositoryKeys: String, CodingKey {
         case nameWithOwner
+    }
+
+    /// Confirmed live (`gh search prs --json author`, gh 2.98.0): an object
+    /// with `login`, `id`, `is_bot`, `type`, `url`. Only `login` is consumed.
+    private enum AuthorKeys: String, CodingKey {
+        case login
     }
 
     // MARK: - Timestamps

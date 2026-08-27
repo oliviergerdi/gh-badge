@@ -6,7 +6,8 @@ final class PRSectioningTests: XCTestCase {
     private func pr(
         _ repo: String,
         _ number: Int,
-        updated: TimeInterval? = nil
+        updated: TimeInterval? = nil,
+        author: String? = nil
     ) -> PullRequest {
         PullRequest(
             repo: repo,
@@ -14,7 +15,8 @@ final class PRSectioningTests: XCTestCase {
             title: "PR \(number)",
             url: "https://github.com/\(repo)/pull/\(number)",
             updatedAt: updated.map { Date(timeIntervalSince1970: $0) },
-            state: "open"
+            state: "open",
+            authorLogin: author
         )
     }
 
@@ -237,6 +239,72 @@ final class PRSectioningTests: XCTestCase {
         XCTAssertEqual(sections.badgeCount, 0)
     }
 
+    // MARK: - Ignored authors
+
+    func testIgnoredAuthorExcludedFromNeedsReview() {
+        let sections = PRSectioning.sections(
+            needsReviewRaw: [pr("watched/repo", 1, author: "dependabot[bot]"), pr("watched/repo", 2, author: "alice")],
+            reviewedByRaw: [],
+            authoredRaw: [],
+            whitelist: ["watched/repo"],
+            ignoreWhitelistForOwnPRs: false,
+            ignoredAuthors: ["dependabot[bot]"]
+        )
+        XCTAssertEqual(sections.needsReview.map(\.number), [2])
+    }
+
+    func testIgnoredAuthorExcludedFromAlreadyReviewed() {
+        let sections = PRSectioning.sections(
+            needsReviewRaw: [],
+            reviewedByRaw: [pr("watched/repo", 1, author: "dependabot[bot]"), pr("watched/repo", 2, author: "alice")],
+            authoredRaw: [],
+            whitelist: ["watched/repo"],
+            ignoreWhitelistForOwnPRs: false,
+            ignoredAuthors: ["dependabot[bot]"]
+        )
+        XCTAssertEqual(sections.alreadyReviewed.map(\.number), [2])
+    }
+
+    /// My Open PRs is always PRs authored by me; the ignore list is about
+    /// other people's PRs, so it must not touch this section.
+    func testIgnoredAuthorDoesNotAffectMyOpenPRs() {
+        let sections = PRSectioning.sections(
+            needsReviewRaw: [],
+            reviewedByRaw: [],
+            authoredRaw: [pr("watched/repo", 1, author: "dependabot[bot]")],
+            whitelist: ["watched/repo"],
+            ignoreWhitelistForOwnPRs: false,
+            ignoredAuthors: ["dependabot[bot]"]
+        )
+        XCTAssertEqual(sections.myOpenPRs.map(\.number), [1])
+    }
+
+    func testIgnoredAuthorMatchingIsCaseInsensitive() {
+        let sections = PRSectioning.sections(
+            needsReviewRaw: [pr("watched/repo", 1, author: "Dependabot[bot]")],
+            reviewedByRaw: [],
+            authoredRaw: [],
+            whitelist: ["watched/repo"],
+            ignoreWhitelistForOwnPRs: false,
+            ignoredAuthors: ["dependabot[bot]"]
+        )
+        XCTAssertTrue(sections.needsReview.isEmpty)
+    }
+
+    /// Can't prove a PR's author is ignored without the field, so it stays —
+    /// same "missing data, don't hide" rule as the staleness filter.
+    func testMissingAuthorIsNotFilteredOut() {
+        let sections = PRSectioning.sections(
+            needsReviewRaw: [pr("watched/repo", 1)],
+            reviewedByRaw: [],
+            authoredRaw: [],
+            whitelist: ["watched/repo"],
+            ignoreWhitelistForOwnPRs: false,
+            ignoredAuthors: ["dependabot[bot]"]
+        )
+        XCTAssertEqual(sections.needsReview.map(\.number), [1])
+    }
+
     // MARK: - Badge
 
     func testBadgeCountsOnlyNeedsReview() {
@@ -248,6 +316,108 @@ final class PRSectioningTests: XCTestCase {
             ignoreWhitelistForOwnPRs: false
         )
         XCTAssertEqual(sections.badgeCount, 1)
+    }
+
+    // MARK: - reviewedCandidates
+
+    func testReviewedCandidatesAppliesWhitelist() {
+        let candidates = PRSectioning.reviewedCandidates(
+            needsReviewRaw: [],
+            reviewedByRaw: [pr("watched/repo", 1), pr("other/repo", 2)],
+            authoredRaw: [],
+            whitelist: ["watched/repo"]
+        )
+        XCTAssertEqual(candidates.map(\.number), [1])
+    }
+
+    /// The exact rule `sections` uses to keep a re-requested review out of
+    /// section 2 — `reviewedCandidates` must agree, since `sections` calls it.
+    func testReviewedCandidatesExcludesNeedsReviewOverlap() {
+        let contested = pr("watched/repo", 1)
+        let candidates = PRSectioning.reviewedCandidates(
+            needsReviewRaw: [contested],
+            reviewedByRaw: [contested, pr("watched/repo", 2)],
+            authoredRaw: [],
+            whitelist: ["watched/repo"]
+        )
+        XCTAssertEqual(candidates.map(\.number), [2])
+    }
+
+    func testReviewedCandidatesRespectsStalenessAndIgnoredAuthors() {
+        let now = Date(timeIntervalSince1970: 100_000)
+        let cutoff = SettingsStore.cutoff(now: now, amount: 1, unit: .days)
+        let candidates = PRSectioning.reviewedCandidates(
+            needsReviewRaw: [],
+            reviewedByRaw: [
+                pr("watched/repo", 1, updated: 90_000, author: "alice"),
+                pr("watched/repo", 2, updated: 1_000, author: "alice"),
+                pr("watched/repo", 3, updated: 90_000, author: "dependabot[bot]"),
+            ],
+            authoredRaw: [],
+            whitelist: ["watched/repo"],
+            ignoreOlderThan: cutoff,
+            ignoredAuthors: ["dependabot[bot]"]
+        )
+        XCTAssertEqual(candidates.map(\.number), [1])
+    }
+
+    // MARK: - Stale reviews (new commits since last review)
+
+    func testStaleReviewMovesFromAlreadyReviewedToNeedsReview() {
+        let stale = pr("watched/repo", 1)
+        let sections = PRSectioning.sections(
+            needsReviewRaw: [],
+            reviewedByRaw: [stale, pr("watched/repo", 2)],
+            authoredRaw: [],
+            whitelist: ["watched/repo"],
+            ignoreWhitelistForOwnPRs: false,
+            staleReviewURLs: [stale.url]
+        )
+        XCTAssertEqual(sections.needsReview.map(\.number), [1])
+        XCTAssertEqual(sections.alreadyReviewed.map(\.number), [2])
+    }
+
+    /// The whole point: it's not just relocated, it counts towards the badge
+    /// like any other PR needing review.
+    func testStaleReviewCountsTowardsBadge() {
+        let stale = pr("watched/repo", 1)
+        let sections = PRSectioning.sections(
+            needsReviewRaw: [pr("watched/repo", 2)],
+            reviewedByRaw: [stale],
+            authoredRaw: [],
+            whitelist: ["watched/repo"],
+            ignoreWhitelistForOwnPRs: false,
+            staleReviewURLs: [stale.url]
+        )
+        XCTAssertEqual(sections.badgeCount, 2)
+    }
+
+    /// A URL not in `reviewedCandidates` (e.g. it got dropped by the whitelist)
+    /// must not be force-added to `needsReview` just because some caller
+    /// mistakenly passed its URL in `staleReviewURLs`.
+    func testStaleReviewURLNotInCandidatesIsIgnored() {
+        let sections = PRSectioning.sections(
+            needsReviewRaw: [],
+            reviewedByRaw: [],
+            authoredRaw: [],
+            whitelist: ["watched/repo"],
+            ignoreWhitelistForOwnPRs: false,
+            staleReviewURLs: ["https://github.com/other/repo/pull/9"]
+        )
+        XCTAssertTrue(sections.needsReview.isEmpty)
+    }
+
+    func testStaleReviewInterleavesByRecencyWithOrdinaryNeedsReview() {
+        let stale = pr("watched/repo", 1, updated: 3_000)
+        let sections = PRSectioning.sections(
+            needsReviewRaw: [pr("watched/repo", 2, updated: 2_000)],
+            reviewedByRaw: [stale],
+            authoredRaw: [],
+            whitelist: ["watched/repo"],
+            ignoreWhitelistForOwnPRs: false,
+            staleReviewURLs: [stale.url]
+        )
+        XCTAssertEqual(sections.needsReview.map(\.number), [1, 2])
     }
 }
 
@@ -310,6 +480,24 @@ final class SettingsNormalizationTests: XCTestCase {
         XCTAssertEqual(StalenessUnit.weeks.seconds, 604_800)
     }
 
+    // MARK: - normalizeAuthor
+
+    func testNormalizeAuthorAcceptsBotLogin() {
+        XCTAssertEqual(SettingsStore.normalizeAuthor("dependabot[bot]"), "dependabot[bot]")
+    }
+
+    func testNormalizeAuthorTrimsWhitespace() {
+        XCTAssertEqual(SettingsStore.normalizeAuthor("  alice \n"), "alice")
+    }
+
+    func testNormalizeAuthorRejectsEmpty() {
+        XCTAssertNil(SettingsStore.normalizeAuthor("   "))
+    }
+
+    func testNormalizeAuthorRejectsSlash() {
+        XCTAssertNil(SettingsStore.normalizeAuthor("owner/repo"))
+    }
+
     func testCutoffComputation() {
         let now = Date(timeIntervalSince1970: 1_000_000)
         let cutoff = SettingsStore.cutoff(now: now, amount: 2, unit: .days)
@@ -320,5 +508,59 @@ final class SettingsNormalizationTests: XCTestCase {
         let now = Date(timeIntervalSince1970: 1_000_000)
         let cutoff = SettingsStore.cutoff(now: now, amount: 0, unit: .days)
         XCTAssertEqual(cutoff.timeIntervalSince1970, 1_000_000 - 86_400, accuracy: 0.001)
+    }
+}
+
+/// Exercises `SettingsStore` instance behaviour (load/persist/mutate) against
+/// an isolated `UserDefaults` suite so runs never touch the real app's
+/// preferences and don't interfere with each other.
+@MainActor
+final class SettingsStoreIgnoredAuthorsTests: XCTestCase {
+
+    private func freshDefaults() -> UserDefaults {
+        let suiteName = "gh-badge-tests-\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suiteName)!
+        defaults.removePersistentDomain(forName: suiteName)
+        return defaults
+    }
+
+    func testDefaultsToDependabotOnFirstRun() {
+        let store = SettingsStore(defaults: freshDefaults())
+        XCTAssertEqual(store.ignoredAuthors, ["dependabot[bot]"])
+    }
+
+    func testExplicitlyEmptiedListStaysEmptyAcrossReload() {
+        let defaults = freshDefaults()
+        let store = SettingsStore(defaults: defaults)
+        store.removeAuthors(Set(store.ignoredAuthors))
+        XCTAssertEqual(store.ignoredAuthors, [])
+
+        let reloaded = SettingsStore(defaults: defaults)
+        XCTAssertEqual(reloaded.ignoredAuthors, [])
+    }
+
+    func testAddAuthorNormalizesAndAppends() {
+        let store = SettingsStore(defaults: freshDefaults())
+        XCTAssertTrue(store.addAuthor("  alice  "))
+        XCTAssertTrue(store.ignoredAuthors.contains("alice"))
+    }
+
+    func testAddAuthorRejectsDuplicateCaseInsensitively() {
+        let store = SettingsStore(defaults: freshDefaults())
+        XCTAssertTrue(store.addAuthor("alice"))
+        XCTAssertFalse(store.addAuthor("ALICE"))
+        XCTAssertEqual(store.ignoredAuthors.filter { $0.caseInsensitiveCompare("alice") == .orderedSame }.count, 1)
+    }
+
+    func testAddAuthorRejectsInvalidInput() {
+        let store = SettingsStore(defaults: freshDefaults())
+        XCTAssertFalse(store.addAuthor("   "))
+    }
+
+    func testRemoveAuthorsRemovesExactMatches() {
+        let store = SettingsStore(defaults: freshDefaults())
+        store.addAuthor("alice")
+        store.removeAuthors(["dependabot[bot]"])
+        XCTAssertEqual(store.ignoredAuthors, ["alice"])
     }
 }

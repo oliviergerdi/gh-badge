@@ -32,6 +32,11 @@ public final class PRStore: ObservableObject {
     private var lastRawReviewedBy: [PullRequest] = []
     private var lastRawAuthored: [PullRequest] = []
 
+    /// URLs of already-reviewed PRs with new commits pushed since the
+    /// viewer's last review. Refreshed each `refresh()` cycle (it needs
+    /// network I/O); local-only recomputes reuse whatever was last fetched.
+    private var lastStaleReviewURLs: Set<String> = []
+
     public init(client: GHClient, settings: SettingsStore) {
         self.client = client
         self.settings = settings
@@ -113,6 +118,17 @@ public final class PRStore: ObservableObject {
                 self?.recomputeSections()
             }
             .store(in: &cancellables)
+
+        // Same reasoning as staleness: a pure display filter over already-
+        // fetched raw results (author is decoded alongside the rest), so it
+        // recomputes locally instead of re-hitting the API.
+        settings.$ignoredAuthors
+            .dropFirst()
+            .debounce(for: .milliseconds(400), scheduler: RunLoop.main)
+            .sink { [weak self] _ in
+                self?.recomputeSections()
+            }
+            .store(in: &cancellables)
     }
 
     // MARK: - Refresh
@@ -187,6 +203,21 @@ public final class PRStore: ObservableObject {
         lastRawReviewedBy = resolvedReviewed
         lastRawAuthored = resolvedAuthored
 
+        // Extra signal `gh search prs` can't provide: for the PRs that would
+        // land in "Already Reviewed", check whether new commits have landed
+        // since the viewer's last review. Non-fatal by design (see
+        // `GHClient.staleReviewURLs`) — a failure here just skips this cycle's
+        // promotion, it never surfaces an error or blocks the rest of refresh.
+        let reviewedCandidates = PRSectioning.reviewedCandidates(
+            needsReviewRaw: resolvedNeeds,
+            reviewedByRaw: resolvedReviewed,
+            authoredRaw: resolvedAuthored,
+            whitelist: settings.repoWhitelist,
+            ignoreOlderThan: settings.ignoreOlderThanCutoff,
+            ignoredAuthors: settings.ignoredAuthors
+        )
+        lastStaleReviewURLs = await ghClient.staleReviewURLs(for: reviewedCandidates)
+
         recomputeSections()
 
         if let firstError {
@@ -218,7 +249,9 @@ public final class PRStore: ObservableObject {
             authoredRaw: lastRawAuthored,
             whitelist: settings.repoWhitelist,
             ignoreWhitelistForOwnPRs: settings.ignoreWhitelistForOwnPRs,
-            ignoreOlderThan: settings.ignoreOlderThanCutoff
+            ignoreOlderThan: settings.ignoreOlderThanCutoff,
+            ignoredAuthors: settings.ignoredAuthors,
+            staleReviewURLs: lastStaleReviewURLs
         )
     }
 
