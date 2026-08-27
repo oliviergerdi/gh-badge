@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CFBundleDevelopmentRegion</key>
+	<string>en</string>
+	<key>CFBundleExecutable</key>
+	<string>gh-badge</string>
+	<key>CFBundleIdentifier</key>
+	<string>com.gerdi.gh-badge</string>
+	<key>CFBundleInfoDictionaryVersion</key>
+	<string>6.0</string>
+	<key>CFBundleName</key>
+	<string>gh-badge</string>
+	<key>CFBundleDisplayName</key>
+	<string>gh-badge</string>
+	<key>CFBundlePackageType</key>
+	<string>APPL</string>
+	<key>CFBundleShortVersionString</key>
+	<string>0.1.0</string>
+	<key>CFBundleVersion</key>
+	<string>1</string>
+	<key>LSMinimumSystemVersion</key>
+	<string>13.0</string>
+	<!-- Menu bar only: no Dock icon, no app switcher entry. -->
+	<key>LSUIElement</key>
+	<true/>
+	<key>NSHumanReadableCopyright</key>
+	<string>Gerdi Olivier</string>
+	<!-- Present so the bundle icon shows in Finder / Login Items once an
+	     AppIcon.icns is dropped into Contents/Resources. Harmless if absent. -->
+	<key>CFBundleIconFile</key>
+	<string>AppIcon</string>
+</dict>
+</plist>
