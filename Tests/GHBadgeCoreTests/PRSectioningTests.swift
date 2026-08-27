@@ -317,6 +317,108 @@ final class PRSectioningTests: XCTestCase {
         )
         XCTAssertEqual(sections.badgeCount, 1)
     }
+
+    // MARK: - reviewedCandidates
+
+    func testReviewedCandidatesAppliesWhitelist() {
+        let candidates = PRSectioning.reviewedCandidates(
+            needsReviewRaw: [],
+            reviewedByRaw: [pr("watched/repo", 1), pr("other/repo", 2)],
+            authoredRaw: [],
+            whitelist: ["watched/repo"]
+        )
+        XCTAssertEqual(candidates.map(\.number), [1])
+    }
+
+    /// The exact rule `sections` uses to keep a re-requested review out of
+    /// section 2 — `reviewedCandidates` must agree, since `sections` calls it.
+    func testReviewedCandidatesExcludesNeedsReviewOverlap() {
+        let contested = pr("watched/repo", 1)
+        let candidates = PRSectioning.reviewedCandidates(
+            needsReviewRaw: [contested],
+            reviewedByRaw: [contested, pr("watched/repo", 2)],
+            authoredRaw: [],
+            whitelist: ["watched/repo"]
+        )
+        XCTAssertEqual(candidates.map(\.number), [2])
+    }
+
+    func testReviewedCandidatesRespectsStalenessAndIgnoredAuthors() {
+        let now = Date(timeIntervalSince1970: 100_000)
+        let cutoff = SettingsStore.cutoff(now: now, amount: 1, unit: .days)
+        let candidates = PRSectioning.reviewedCandidates(
+            needsReviewRaw: [],
+            reviewedByRaw: [
+                pr("watched/repo", 1, updated: 90_000, author: "alice"),
+                pr("watched/repo", 2, updated: 1_000, author: "alice"),
+                pr("watched/repo", 3, updated: 90_000, author: "dependabot[bot]"),
+            ],
+            authoredRaw: [],
+            whitelist: ["watched/repo"],
+            ignoreOlderThan: cutoff,
+            ignoredAuthors: ["dependabot[bot]"]
+        )
+        XCTAssertEqual(candidates.map(\.number), [1])
+    }
+
+    // MARK: - Stale reviews (new commits since last review)
+
+    func testStaleReviewMovesFromAlreadyReviewedToNeedsReview() {
+        let stale = pr("watched/repo", 1)
+        let sections = PRSectioning.sections(
+            needsReviewRaw: [],
+            reviewedByRaw: [stale, pr("watched/repo", 2)],
+            authoredRaw: [],
+            whitelist: ["watched/repo"],
+            ignoreWhitelistForOwnPRs: false,
+            staleReviewURLs: [stale.url]
+        )
+        XCTAssertEqual(sections.needsReview.map(\.number), [1])
+        XCTAssertEqual(sections.alreadyReviewed.map(\.number), [2])
+    }
+
+    /// The whole point: it's not just relocated, it counts towards the badge
+    /// like any other PR needing review.
+    func testStaleReviewCountsTowardsBadge() {
+        let stale = pr("watched/repo", 1)
+        let sections = PRSectioning.sections(
+            needsReviewRaw: [pr("watched/repo", 2)],
+            reviewedByRaw: [stale],
+            authoredRaw: [],
+            whitelist: ["watched/repo"],
+            ignoreWhitelistForOwnPRs: false,
+            staleReviewURLs: [stale.url]
+        )
+        XCTAssertEqual(sections.badgeCount, 2)
+    }
+
+    /// A URL not in `reviewedCandidates` (e.g. it got dropped by the whitelist)
+    /// must not be force-added to `needsReview` just because some caller
+    /// mistakenly passed its URL in `staleReviewURLs`.
+    func testStaleReviewURLNotInCandidatesIsIgnored() {
+        let sections = PRSectioning.sections(
+            needsReviewRaw: [],
+            reviewedByRaw: [],
+            authoredRaw: [],
+            whitelist: ["watched/repo"],
+            ignoreWhitelistForOwnPRs: false,
+            staleReviewURLs: ["https://github.com/other/repo/pull/9"]
+        )
+        XCTAssertTrue(sections.needsReview.isEmpty)
+    }
+
+    func testStaleReviewInterleavesByRecencyWithOrdinaryNeedsReview() {
+        let stale = pr("watched/repo", 1, updated: 3_000)
+        let sections = PRSectioning.sections(
+            needsReviewRaw: [pr("watched/repo", 2, updated: 2_000)],
+            reviewedByRaw: [stale],
+            authoredRaw: [],
+            whitelist: ["watched/repo"],
+            ignoreWhitelistForOwnPRs: false,
+            staleReviewURLs: [stale.url]
+        )
+        XCTAssertEqual(sections.needsReview.map(\.number), [1, 2])
+    }
 }
 
 final class SettingsNormalizationTests: XCTestCase {

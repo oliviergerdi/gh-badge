@@ -171,4 +171,122 @@ final class PullRequestDecodingTests: XCTestCase {
         """
         XCTAssertEqual(GHClient.condense(stderr), "error connecting to api.github.com")
     }
+
+    // MARK: - StaleReviewQuery.build
+
+    func testBuildOneAliasPerPR() {
+        let prs = [
+            PullRequest(repo: "a/b", number: 1, title: "x", url: "u1"),
+            PullRequest(repo: "c/d", number: 2, title: "y", url: "u2"),
+        ]
+        let query = StaleReviewQuery.build(for: prs)
+        XCTAssertTrue(query.contains(#"r0: repository(owner: "a", name: "b")"#))
+        XCTAssertTrue(query.contains("pullRequest(number: 1)"))
+        XCTAssertTrue(query.contains(#"r1: repository(owner: "c", name: "d")"#))
+        XCTAssertTrue(query.contains("pullRequest(number: 2)"))
+    }
+
+    func testBuildEscapesQuotesInRepoName() {
+        let prs = [PullRequest(repo: #"a"b/c"#, number: 1, title: "x", url: "u1")]
+        let query = StaleReviewQuery.build(for: prs)
+        XCTAssertTrue(query.contains(#"owner: "a\"b""#))
+    }
+
+    // MARK: - StaleReviewQuery.parse (batched GraphQL)
+
+    func testParseFlagsPRWhoseHeadMovedPastTheReview() throws {
+        let pr = PullRequest(repo: "a/b", number: 1, title: "x", url: "https://github.com/a/b/pull/1")
+        let json = """
+        {"data":{"r0":{"pullRequest":{
+          "headRefOid": "new-commit",
+          "viewerLatestReview": { "commit": { "oid": "old-commit" } }
+        }}}}
+        """
+        let stale = StaleReviewQuery.parse(Data(json.utf8), prs: [pr])
+        XCTAssertEqual(stale, [pr.url])
+    }
+
+    func testParseDoesNotFlagPRAtTheReviewedCommit() throws {
+        let pr = PullRequest(repo: "a/b", number: 1, title: "x", url: "https://github.com/a/b/pull/1")
+        let json = """
+        {"data":{"r0":{"pullRequest":{
+          "headRefOid": "same-commit",
+          "viewerLatestReview": { "commit": { "oid": "same-commit" } }
+        }}}}
+        """
+        XCTAssertTrue(StaleReviewQuery.parse(Data(json.utf8), prs: [pr]).isEmpty)
+    }
+
+    /// No review from the viewer at all (e.g. a token/viewer mismatch) can't be
+    /// proven stale, so it must not be flagged.
+    func testParseTreatsMissingViewerReviewAsNotStale() throws {
+        let pr = PullRequest(repo: "a/b", number: 1, title: "x", url: "https://github.com/a/b/pull/1")
+        let json = """
+        {"data":{"r0":{"pullRequest":{
+          "headRefOid": "new-commit",
+          "viewerLatestReview": null
+        }}}}
+        """
+        XCTAssertTrue(StaleReviewQuery.parse(Data(json.utf8), prs: [pr]).isEmpty)
+    }
+
+    func testParseIsPositionalAcrossMultiplePRs() throws {
+        let staleOne = PullRequest(repo: "a/b", number: 1, title: "x", url: "https://github.com/a/b/pull/1")
+        let freshOne = PullRequest(repo: "c/d", number: 2, title: "y", url: "https://github.com/c/d/pull/2")
+        let json = """
+        {"data":{
+          "r0":{"pullRequest":{"headRefOid":"new","viewerLatestReview":{"commit":{"oid":"old"}}}},
+          "r1":{"pullRequest":{"headRefOid":"same","viewerLatestReview":{"commit":{"oid":"same"}}}}
+        }}
+        """
+        let stale = StaleReviewQuery.parse(Data(json.utf8), prs: [staleOne, freshOne])
+        XCTAssertEqual(stale, [staleOne.url])
+    }
+
+    func testParseToleratesTotallyMalformedResponse() {
+        let pr = PullRequest(repo: "a/b", number: 1, title: "x", url: "https://github.com/a/b/pull/1")
+        XCTAssertTrue(StaleReviewQuery.parse(Data("not json".utf8), prs: [pr]).isEmpty)
+    }
+
+    // MARK: - StaleReviewQuery.parsePerPRView (fallback path)
+
+    func testParsePerPRViewFlagsHeadPastMyLatestReview() {
+        let pr = PullRequest(repo: "a/b", number: 1, title: "x", url: "https://github.com/a/b/pull/1")
+        let json = """
+        {
+          "headRefOid": "new-commit",
+          "reviews": [
+            { "author": { "login": "me" }, "submittedAt": "2026-01-01T00:00:00Z", "commit": { "oid": "old-commit" } }
+          ]
+        }
+        """
+        XCTAssertEqual(StaleReviewQuery.parsePerPRView(Data(json.utf8), pr: pr, viewerLogin: "me"), pr.url)
+    }
+
+    func testParsePerPRViewPicksTheLatestOfMyMultipleReviews() {
+        let pr = PullRequest(repo: "a/b", number: 1, title: "x", url: "https://github.com/a/b/pull/1")
+        let json = """
+        {
+          "headRefOid": "commit-2",
+          "reviews": [
+            { "author": { "login": "me" }, "submittedAt": "2026-01-01T00:00:00Z", "commit": { "oid": "commit-1" } },
+            { "author": { "login": "me" }, "submittedAt": "2026-01-02T00:00:00Z", "commit": { "oid": "commit-2" } }
+          ]
+        }
+        """
+        XCTAssertNil(StaleReviewQuery.parsePerPRView(Data(json.utf8), pr: pr, viewerLogin: "me"))
+    }
+
+    func testParsePerPRViewIgnoresOtherReviewers() {
+        let pr = PullRequest(repo: "a/b", number: 1, title: "x", url: "https://github.com/a/b/pull/1")
+        let json = """
+        {
+          "headRefOid": "new-commit",
+          "reviews": [
+            { "author": { "login": "someone-else" }, "submittedAt": "2026-01-02T00:00:00Z", "commit": { "oid": "new-commit" } }
+          ]
+        }
+        """
+        XCTAssertNil(StaleReviewQuery.parsePerPRView(Data(json.utf8), pr: pr, viewerLogin: "me"))
+    }
 }

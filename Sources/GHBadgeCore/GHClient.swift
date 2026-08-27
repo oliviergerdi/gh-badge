@@ -35,6 +35,93 @@ public enum GHError: LocalizedError, Equatable, Sendable {
     }
 }
 
+/// Pure query-building and response-parsing for the stale-review check,
+/// deliberately separated from `GHClient` so it's testable without spawning a
+/// process. "Stale" here means: the viewer reviewed this PR, and its head
+/// commit has since moved past the commit that review was submitted against.
+enum StaleReviewQuery {
+    /// One aliased `repository` block per PR, so an arbitrary-length list of
+    /// checks batches into a single GraphQL request instead of N round-trips.
+    /// `viewerLatestReview` is a GraphQL convenience field scoped to the
+    /// authenticated caller — no need to know or match the viewer's login.
+    static func build(for prs: [PullRequest]) -> String {
+        let blocks = prs.enumerated().compactMap { index, pr -> String? in
+            let parts = pr.repo.split(separator: "/", maxSplits: 1).map(String.init)
+            guard parts.count == 2 else { return nil }
+            return """
+            r\(index): repository(owner: "\(escape(parts[0]))", name: "\(escape(parts[1]))") {
+              pullRequest(number: \(pr.number)) {
+                headRefOid
+                viewerLatestReview { commit { oid } }
+              }
+            }
+            """
+        }
+        return "query {\n" + blocks.joined(separator: "\n") + "\n}"
+    }
+
+    private static func escape(_ s: String) -> String {
+        s.replacingOccurrences(of: "\\", with: "\\\\").replacingOccurrences(of: "\"", with: "\\\"")
+    }
+
+    /// `prs` must be in the same order passed to `build(for:)`: the alias index
+    /// (`r0`, `r1`, …) is positional, not carried in the response.
+    ///
+    /// Any node that's missing, malformed, or lacks a review from the viewer is
+    /// treated as "not stale" — same "can't prove it, don't move it" rule used
+    /// elsewhere: a parsing gap should never wrongly yank a PR out of the
+    /// reviewed list.
+    static func parse(_ responseData: Data, prs: [PullRequest]) -> Set<String> {
+        guard
+            let root = try? JSONSerialization.jsonObject(with: responseData) as? [String: Any],
+            let data = root["data"] as? [String: Any]
+        else { return [] }
+
+        var stale = Set<String>()
+        for (index, pr) in prs.enumerated() {
+            guard
+                let repoNode = data["r\(index)"] as? [String: Any],
+                let prNode = repoNode["pullRequest"] as? [String: Any],
+                let headRefOid = prNode["headRefOid"] as? String,
+                let review = prNode["viewerLatestReview"] as? [String: Any],
+                let commit = review["commit"] as? [String: Any],
+                let reviewedOid = commit["oid"] as? String
+            else { continue }
+
+            if reviewedOid != headRefOid {
+                stale.insert(pr.url)
+            }
+        }
+        return stale
+    }
+
+    /// Fallback parser for `gh pr view <n> --json headRefOid,reviews`: same
+    /// "stale = reviewed commit differs from current head" rule, but the
+    /// viewer's review has to be picked out by login (no `viewerLatestReview`
+    /// convenience field on this shape) — the most recent one by `submittedAt`.
+    static func parsePerPRView(_ data: Data, pr: PullRequest, viewerLogin: String) -> String? {
+        guard
+            let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+            let headRefOid = root["headRefOid"] as? String,
+            let reviews = root["reviews"] as? [[String: Any]]
+        else { return nil }
+
+        let mine = reviews.filter { ($0["author"] as? [String: Any])?["login"] as? String == viewerLogin }
+        guard let latest = mine.max(by: { submittedDate($0) < submittedDate($1) }) else { return nil }
+
+        guard
+            let commit = latest["commit"] as? [String: Any],
+            let reviewedOid = commit["oid"] as? String
+        else { return nil }
+
+        return reviewedOid != headRefOid ? pr.url : nil
+    }
+
+    private static func submittedDate(_ review: [String: Any]) -> Date {
+        (review["submittedAt"] as? String).flatMap(PullRequest.parseTimestamp) ?? .distantPast
+    }
+}
+
 /// Everything that touches the `gh` binary. No GitHub API client, no token
 /// handling, no Keychain access of our own — `gh` owns all of that.
 public actor GHClient {
@@ -272,6 +359,84 @@ public actor GHClient {
             let raw = String(data: data, encoding: .utf8) ?? "<non-utf8>"
             log.error("decode failed: \(String(describing: error), privacy: .public)\nraw: \(raw, privacy: .public)")
             throw GHError.decodingFailed(detail: String(describing: error))
+        }
+    }
+
+    // MARK: - Stale reviews (new commits since the viewer's last review)
+
+    /// For each PR in `candidates`, checks whether its head commit has moved
+    /// past the viewer's last review on it. Tries one batched GraphQL request
+    /// first; if that fails outright (transport error, bad exit, unreadable
+    /// response), falls back to one `gh pr view` per PR.
+    ///
+    /// Never throws: this is a display enhancement, not core functionality, so
+    /// a total failure here should silently skip the enhancement rather than
+    /// surface an error banner or block a refresh.
+    public func staleReviewURLs(for candidates: [PullRequest]) async -> Set<String> {
+        guard !candidates.isEmpty else { return [] }
+        if let viaGraphQL = await staleReviewURLsViaGraphQL(candidates) {
+            return viaGraphQL
+        }
+        log.info("stale-review GraphQL batch failed; falling back to per-PR gh pr view")
+        return await staleReviewURLsPerPR(candidates)
+    }
+
+    /// nil means the batched call failed outright; the caller falls back to
+    /// per-PR calls rather than treating that as "nothing is stale".
+    private func staleReviewURLsViaGraphQL(_ candidates: [PullRequest]) async -> Set<String>? {
+        guard let path = try? await ghPath() else { return nil }
+        let query = StaleReviewQuery.build(for: candidates)
+        do {
+            let result = try await ProcessRunner.run(
+                executable: path,
+                arguments: ["api", "graphql", "-f", "query=\(query)"],
+                environment: environment(),
+                timeout: requestTimeout
+            )
+            guard result.exitCode == 0, !result.stdout.isEmpty else { return nil }
+            return StaleReviewQuery.parse(result.stdout, prs: candidates)
+        } catch {
+            return nil
+        }
+    }
+
+    private func staleReviewURLsPerPR(_ candidates: [PullRequest]) async -> Set<String> {
+        guard let path = try? await ghPath(), let login = cachedLogin else { return [] }
+        let env = environment()
+        let timeout = requestTimeout
+
+        return await withTaskGroup(of: String?.self) { group in
+            for pr in candidates {
+                group.addTask {
+                    await Self.staleReviewURLPerPR(path: path, pr: pr, login: login, environment: env, timeout: timeout)
+                }
+            }
+            var stale = Set<String>()
+            for await url in group {
+                if let url { stale.insert(url) }
+            }
+            return stale
+        }
+    }
+
+    private static func staleReviewURLPerPR(
+        path: String,
+        pr: PullRequest,
+        login: String,
+        environment: [String: String],
+        timeout: TimeInterval
+    ) async -> String? {
+        do {
+            let result = try await ProcessRunner.run(
+                executable: path,
+                arguments: ["pr", "view", String(pr.number), "--repo", pr.repo, "--json", "headRefOid,reviews"],
+                environment: environment,
+                timeout: timeout
+            )
+            guard result.exitCode == 0 else { return nil }
+            return StaleReviewQuery.parsePerPRView(result.stdout, pr: pr, viewerLogin: login)
+        } catch {
+            return nil
         }
     }
 
