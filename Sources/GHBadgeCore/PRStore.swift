@@ -37,6 +37,14 @@ public final class PRStore: ObservableObject {
     /// network I/O); local-only recomputes reuse whatever was last fetched.
     private var lastStaleReviewURLs: Set<String> = []
 
+    /// Consecutive *transient* failures (network blip, timeout, a `gh`
+    /// command erroring) — never incremented for fatal configuration errors,
+    /// which need user action, not a faster retry. Reset to 0 by any
+    /// successful refresh or fatal error. Drives `RetryBackoff.delay`, so the
+    /// poll loop retries sooner than the normal interval after a failure
+    /// instead of leaving a stale badge up to the user to manually refresh.
+    private var consecutiveFailureCount = 0
+
     public init(client: GHClient, settings: SettingsStore) {
         self.client = client
         self.settings = settings
@@ -65,9 +73,13 @@ public final class PRStore: ObservableObject {
             while !Task.isCancelled {
                 guard let self else { return }
                 await self.refresh()
-                let seconds = self.settings.refreshIntervalSeconds
+                let normalInterval = TimeInterval(self.settings.refreshIntervalSeconds)
+                let delay = RetryBackoff.delay(
+                    failureCount: self.consecutiveFailureCount,
+                    normalInterval: normalInterval
+                )
                 do {
-                    try await Task.sleep(nanoseconds: UInt64(seconds) * 1_000_000_000)
+                    try await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
                 } catch {
                     return  // cancelled
                 }
@@ -241,12 +253,17 @@ public final class PRStore: ObservableObject {
             } else {
                 ghError = firstError.errorDescription
                 needsUserAction = false
+                // Transient: back off and retry sooner than the normal
+                // interval instead of leaving stale data up until the next
+                // scheduled poll or a manual click. See `RetryBackoff`.
+                consecutiveFailureCount += 1
             }
             log.error("refresh completed with error: \(firstError.errorDescription ?? "?", privacy: .public)")
         } else {
             ghError = nil
             needsUserAction = false
             lastUpdated = Date()
+            consecutiveFailureCount = 0
         }
     }
 
@@ -276,6 +293,10 @@ public final class PRStore: ObservableObject {
     private func apply(fatal error: GHError) {
         ghError = error.errorDescription
         needsUserAction = error.isFatalConfiguration
+        // Fatal configuration errors (gh missing, not authenticated) need the
+        // user to act; retrying faster won't help, so this doesn't feed
+        // `RetryBackoff` — the poll loop just keeps its normal cadence.
+        consecutiveFailureCount = 0
         log.error("fatal: \(error.errorDescription ?? "?", privacy: .public)")
     }
 
@@ -290,19 +311,45 @@ public final class PRStore: ObservableObject {
         await withTaskGroup(of: Result<[PullRequest], GHError>.self) { group in
             for filters in jobs {
                 group.addTask {
-                    do {
-                        return .success(try await client.searchPRs(filters: filters))
-                    } catch let error as GHError {
-                        return .failure(error)
-                    } catch {
-                        return .failure(.commandFailed(detail: error.localizedDescription))
-                    }
+                    await Self.searchPRsWithRetry(client: client, filters: filters)
                 }
             }
             var out: [Result<[PullRequest], GHError>] = []
             for await result in group { out.append(result) }
             return out
         }
+    }
+
+    /// A single flaky `gh` invocation (e.g. "connection closed by peer" on one
+    /// concurrent subprocess call) shouldn't need an entire extra poll cycle —
+    /// and the error banner that comes with it — just because sibling jobs in
+    /// the same batch happened to succeed. Retries in place, a few times, with
+    /// a short backoff, before giving up and letting the caller treat it as a
+    /// failed job. See `RetryBackoff.jobRetryDelay`.
+    ///
+    /// Fatal configuration errors (`gh` missing, not authenticated) are not
+    /// retried here: every attempt would fail identically, and that class of
+    /// error needs user action, not persistence.
+    private static func searchPRsWithRetry(
+        client: GHClient,
+        filters: [String]
+    ) async -> Result<[PullRequest], GHError> {
+        var lastError = GHError.commandFailed(detail: "")
+        for attempt in 1...RetryBackoff.maxJobAttempts {
+            do {
+                return .success(try await client.searchPRs(filters: filters))
+            } catch let error as GHError {
+                lastError = error
+                if error.isFatalConfiguration { break }
+            } catch {
+                lastError = .commandFailed(detail: error.localizedDescription)
+            }
+            if attempt < RetryBackoff.maxJobAttempts {
+                let delay = RetryBackoff.jobRetryDelay(attempt: attempt)
+                try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
+            }
+        }
+        return .failure(lastError)
     }
 
     /// Partial success is still useful: if the personal review query works and a
