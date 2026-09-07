@@ -657,4 +657,36 @@ final class SettingsStoreIgnoredAuthorsTests: XCTestCase {
         let reloaded = SettingsStore(defaults: defaults)
         XCTAssertTrue(reloaded.showDraftPRs)
     }
+
+    // MARK: - showAuthorName
+
+    func testShowAuthorNameDefaultsToFalse() {
+        let store = SettingsStore(defaults: freshDefaults())
+        XCTAssertFalse(store.showAuthorName)
+    }
+
+    func testShowAuthorNamePersistsAcrossReload() {
+        let defaults = freshDefaults()
+        let store = SettingsStore(defaults: defaults)
+        store.showAuthorName = true
+
+        let reloaded = SettingsStore(defaults: defaults)
+        XCTAssertTrue(reloaded.showAuthorName)
+    }
+
+    // MARK: - showBranchName
+
+    func testShowBranchNameDefaultsToFalse() {
+        let store = SettingsStore(defaults: freshDefaults())
+        XCTAssertFalse(store.showBranchName)
+    }
+
+    func testShowBranchNamePersistsAcrossReload() {
+        let defaults = freshDefaults()
+        let store = SettingsStore(defaults: defaults)
+        store.showBranchName = true
+
+        let reloaded = SettingsStore(defaults: defaults)
+        XCTAssertTrue(reloaded.showBranchName)
+    }
 }

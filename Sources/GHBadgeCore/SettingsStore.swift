@@ -28,6 +28,8 @@ public final class SettingsStore: ObservableObject {
         public static let ignoreOlderThanUnit = "ignoreOlderThanUnit"
         public static let ignoredAuthors = "ignoredAuthors"
         public static let showDraftPRs = "showDraftPRs"
+        public static let showAuthorName = "showAuthorName"
+        public static let showBranchName = "showBranchName"
     }
 
     public static let refreshIntervalOptions = [60, 120, 300, 600]
@@ -106,6 +108,24 @@ public final class SettingsStore: ObservableObject {
         didSet { persist(showDraftPRs, Key.showDraftPRs) }
     }
 
+    /// Show the author's login (with a person icon) on each PR row. Off by
+    /// default to keep rows as compact as today unless the user opts in. Free
+    /// to render: the author is already part of every `gh search prs` result
+    /// (see `PullRequest.authorLogin`), so this needs no extra query.
+    @Published public var showAuthorName: Bool = false {
+        didSet { persist(showAuthorName, Key.showAuthorName) }
+    }
+
+    /// Show each PR's head branch name. Off by default: unlike author name,
+    /// this is *not* free. `gh search prs` has no branch field at all, so
+    /// showing it means widening the existing stale-review revision check
+    /// (`GHClient.fetchRevisionInfo`) to run over every currently-listed PR
+    /// instead of just "Already Reviewed" candidates — one extra `gh api
+    /// graphql` call per refresh, only when this is on.
+    @Published public var showBranchName: Bool = false {
+        didSet { persist(showBranchName, Key.showBranchName) }
+    }
+
     public init(defaults: UserDefaults = .standard) {
         self.defaults = defaults
         load()
@@ -129,6 +149,8 @@ public final class SettingsStore: ObservableObject {
             ?? StalenessUnit.days.rawValue
         ignoredAuthors = defaults.stringArray(forKey: Key.ignoredAuthors) ?? Self.defaultIgnoredAuthors
         showDraftPRs = defaults.bool(forKey: Key.showDraftPRs)
+        showAuthorName = defaults.bool(forKey: Key.showAuthorName)
+        showBranchName = defaults.bool(forKey: Key.showBranchName)
         isLoading = false
     }
 

@@ -5,6 +5,7 @@ import SwiftUI
 struct DropdownView: View {
     @ObservedObject var store: PRStore
     @ObservedObject var settings: SettingsStore
+    @ObservedObject var seen: SeenPRStore
     let onOpenSettings: () -> Void
 
     private static let contentWidth: CGFloat = 460
@@ -32,19 +33,31 @@ struct DropdownView: View {
                         title: "Needs My Review",
                         systemImage: "eye",
                         pullRequests: store.sections.needsReview,
-                        emptyText: emptyText(forReviewSection: true)
+                        emptyText: emptyText(forReviewSection: true),
+                        seen: seen,
+                        showAuthorName: settings.showAuthorName,
+                        showBranchName: settings.showBranchName,
+                        branchNames: store.branchNames
                     )
                     PRSection(
                         title: "Already Reviewed, Still Open",
                         systemImage: "checkmark.circle",
                         pullRequests: store.sections.alreadyReviewed,
-                        emptyText: emptyText(forReviewSection: true)
+                        emptyText: emptyText(forReviewSection: true),
+                        seen: seen,
+                        showAuthorName: settings.showAuthorName,
+                        showBranchName: settings.showBranchName,
+                        branchNames: store.branchNames
                     )
                     PRSection(
                         title: "My Open PRs",
                         systemImage: "arrow.triangle.pull",
                         pullRequests: store.sections.myOpenPRs,
-                        emptyText: emptyText(forReviewSection: false)
+                        emptyText: emptyText(forReviewSection: false),
+                        seen: seen,
+                        showAuthorName: settings.showAuthorName,
+                        showBranchName: settings.showBranchName,
+                        branchNames: store.branchNames
                     )
                 }
                 .padding(.vertical, 10)
@@ -96,6 +109,10 @@ private struct PRSection: View {
     let systemImage: String
     let pullRequests: [PullRequest]
     let emptyText: String
+    @ObservedObject var seen: SeenPRStore
+    let showAuthorName: Bool
+    let showBranchName: Bool
+    let branchNames: [String: String]
 
     var body: some View {
         VStack(alignment: .leading, spacing: 2) {
@@ -123,7 +140,12 @@ private struct PRSection: View {
                     .padding(.vertical, 2)
             } else {
                 ForEach(pullRequests) { pr in
-                    PRRow(pullRequest: pr)
+                    PRRow(
+                        pullRequest: pr,
+                        seen: seen,
+                        showAuthorName: showAuthorName,
+                        branchName: showBranchName ? branchNames[pr.url] : nil
+                    )
                 }
             }
         }
@@ -132,7 +154,18 @@ private struct PRSection: View {
 
 private struct PRRow: View {
     let pullRequest: PullRequest
+    @ObservedObject var seen: SeenPRStore
+    let showAuthorName: Bool
+    /// Already resolved (and gated on `showBranchName`) by the caller — nil
+    /// means either the setting is off or no branch name is known yet.
+    let branchName: String?
     @State private var isHovering = false
+
+    /// Dimmed once you've opened it and nothing's changed since; the moment a
+    /// refresh shows a newer `updatedAt`, this flips back on its own.
+    private var isDimmed: Bool {
+        SeenPRs.isDimmed(pr: pullRequest, lastSeenUpdatedAt: seen.seen[pullRequest.url])
+    }
 
     var body: some View {
         Button(action: open) {
@@ -153,6 +186,22 @@ private struct PRRow: View {
                         Text("·")
                         Text(RelativeTime.string(for: updatedAt))
                     }
+                    if showAuthorName, let author = pullRequest.authorLogin {
+                        Text("·")
+                        Image(systemName: "person.fill")
+                            .imageScale(.small)
+                        Text(author)
+                            .lineLimit(1)
+                            .truncationMode(.tail)
+                    }
+                    if let branchName {
+                        Text("·")
+                        Image(systemName: "arrow.triangle.branch")
+                            .imageScale(.small)
+                        Text(branchName)
+                            .lineLimit(1)
+                            .truncationMode(.tail)
+                    }
                 }
                 .font(.system(size: 10))
                 .foregroundStyle(.secondary)
@@ -167,6 +216,7 @@ private struct PRRow: View {
             .padding(.leading, 12)
             .padding(.trailing, 4)
             .contentShape(Rectangle())
+            .opacity(isDimmed ? 0.55 : 1)
         }
         .buttonStyle(.plain)
         .onHover { isHovering = $0 }
@@ -176,6 +226,7 @@ private struct PRRow: View {
     private func open() {
         guard let url = URL(string: pullRequest.url) else { return }
         NSWorkspace.shared.open(url)
+        seen.markOpened(pullRequest)
     }
 }
 

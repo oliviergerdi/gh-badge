@@ -11,6 +11,11 @@ public final class PRStore: ObservableObject {
     @Published public private(set) var isRefreshing = false
     @Published public private(set) var lastUpdated: Date?
 
+    /// PR URL -> head branch name, populated only while `settings.showBranchName`
+    /// is on (see `refresh()`). Empty otherwise, including right after the
+    /// setting is turned off, so stale data can't linger in the dropdown.
+    @Published public private(set) var branchNames: [String: String] = [:]
+
     /// True while `gh` is missing or unauthenticated: the icon shows a warning
     /// and polling keeps retrying, but nothing useful will happen until the user
     /// acts.
@@ -99,17 +104,20 @@ public final class PRStore: ObservableObject {
 
         // Anything that changes *what* we query should take effect promptly,
         // debounced so that typing in the whitelist editor is not one API call
-        // per keystroke.
+        // per keystroke. `showBranchName` belongs here, not with the local
+        // display filters below: flipping it changes how wide the revision-info
+        // query is (see `refresh()`), so it needs a real re-fetch.
         let whitelistChanged = settings.$repoWhitelist.map { _ in () }
         let teamsChanged = settings.$teams.map { _ in () }
         let teamToggleChanged = settings.$teamReviewEnabled.map { _ in () }
         let ownPRsToggleChanged = settings.$ignoreWhitelistForOwnPRs.map { _ in () }
+        let branchNameToggleChanged = settings.$showBranchName.map { _ in () }
 
         whitelistChanged
-            .merge(with: teamsChanged, teamToggleChanged, ownPRsToggleChanged)
+            .merge(with: teamsChanged, teamToggleChanged, ownPRsToggleChanged, branchNameToggleChanged)
             // Each @Published publisher replays its current value on subscribe,
-            // so the four merged sources emit four times before any real change.
-            .dropFirst(4)
+            // so the five merged sources emit five times before any real change.
+            .dropFirst(5)
             .debounce(for: .milliseconds(600), scheduler: RunLoop.main)
             .sink { [weak self] _ in
                 Task { await self?.refresh() }
@@ -228,8 +236,9 @@ public final class PRStore: ObservableObject {
         // Extra signal `gh search prs` can't provide: for the PRs that would
         // land in "Already Reviewed", check whether new commits have landed
         // since the viewer's last review. Non-fatal by design (see
-        // `GHClient.staleReviewURLs`) — a failure here just skips this cycle's
-        // promotion, it never surfaces an error or blocks the rest of refresh.
+        // `GHClient.fetchRevisionInfo`) — a failure here just skips this
+        // cycle's promotion/branch names, it never surfaces an error or
+        // blocks the rest of refresh.
         let reviewedCandidates = PRSectioning.reviewedCandidates(
             needsReviewRaw: resolvedNeeds,
             reviewedByRaw: resolvedReviewed,
@@ -239,7 +248,34 @@ public final class PRStore: ObservableObject {
             ignoredAuthors: settings.ignoredAuthors,
             showDraftPRs: settings.showDraftPRs
         )
-        lastStaleReviewURLs = await ghClient.staleReviewURLs(for: reviewedCandidates)
+
+        // Branch names cost one extra `gh api graphql` call, so only when the
+        // setting is on do we widen the query from "Already Reviewed"
+        // candidates to every PR that will actually be visible — the same set
+        // `recomputeSections()` below will land on, computed here purely
+        // in-memory (no I/O) just to know what to ask for.
+        let revisionCandidates: [PullRequest]
+        if settings.showBranchName {
+            let preliminary = PRSectioning.sections(
+                needsReviewRaw: resolvedNeeds,
+                reviewedByRaw: resolvedReviewed,
+                authoredRaw: resolvedAuthored,
+                whitelist: settings.repoWhitelist,
+                ignoreWhitelistForOwnPRs: settings.ignoreWhitelistForOwnPRs,
+                ignoreOlderThan: settings.ignoreOlderThanCutoff,
+                ignoredAuthors: settings.ignoredAuthors,
+                showDraftPRs: settings.showDraftPRs
+            )
+            revisionCandidates = PRSectioning.dedupe(
+                preliminary.needsReview + preliminary.alreadyReviewed + preliminary.myOpenPRs
+            )
+        } else {
+            revisionCandidates = reviewedCandidates
+        }
+
+        let revisionInfo = await ghClient.fetchRevisionInfo(for: revisionCandidates)
+        lastStaleReviewURLs = revisionInfo.staleReviewURLs
+        branchNames = settings.showBranchName ? revisionInfo.branchNames : [:]
 
         recomputeSections()
 

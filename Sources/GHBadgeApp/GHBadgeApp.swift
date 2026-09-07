@@ -16,6 +16,7 @@ final class AppEnvironment {
 
     let settings: SettingsStore
     let store: PRStore
+    let seenPRs = SeenPRStore()
     let loginItems = LoginItemController()
 
     /// Created lazily: its initializer captures `self` (the settings opener lives
@@ -23,6 +24,7 @@ final class AppEnvironment {
     lazy var statusItem = StatusItemController(
         store: store,
         settings: settings,
+        seen: seenPRs,
         onOpenSettings: { [weak self] in self?.openSettingsWindow() }
     )
 
@@ -36,6 +38,21 @@ final class AppEnvironment {
         // Reflect reality: the user may have removed the login item in System
         // Settings since last launch.
         settings.launchAtLogin = loginItems.reconcile(storedPreference: settings.launchAtLogin)
+
+        // Keep the "opened" map from growing forever: once a PR drops out of
+        // every section (closed, merged, or filtered out for good), there's
+        // no reason left to remember it.
+        let seenPRs = self.seenPRs
+        store.$sections
+            .map { sections in
+                Set(sections.needsReview.map(\.url))
+                    .union(sections.alreadyReviewed.map(\.url))
+                    .union(sections.myOpenPRs.map(\.url))
+            }
+            .sink { urls in
+                seenPRs.prune(keeping: urls)
+            }
+            .store(in: &cancellables)
 
         settings.$launchAtLogin
             .dropFirst()

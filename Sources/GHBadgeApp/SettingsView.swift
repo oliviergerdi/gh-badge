@@ -66,6 +66,17 @@ struct SettingsView: View {
             }
 
             Section {
+                Toggle("Show author name on PR line", isOn: $settings.showAuthorName)
+                Toggle("Show branch name on PR line", isOn: $settings.showBranchName)
+            } header: {
+                Text("Display")
+            } footer: {
+                Text("Branch name costs one extra GitHub API call per refresh, only made while this is on.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+
+            Section {
                 Toggle("Show draft pull requests", isOn: $settings.showDraftPRs)
             } header: {
                 Text("Drafts")
