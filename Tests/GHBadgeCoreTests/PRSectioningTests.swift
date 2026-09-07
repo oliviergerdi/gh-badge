@@ -7,7 +7,8 @@ final class PRSectioningTests: XCTestCase {
         _ repo: String,
         _ number: Int,
         updated: TimeInterval? = nil,
-        author: String? = nil
+        author: String? = nil,
+        draft: Bool = false
     ) -> PullRequest {
         PullRequest(
             repo: repo,
@@ -16,7 +17,8 @@ final class PRSectioningTests: XCTestCase {
             url: "https://github.com/\(repo)/pull/\(number)",
             updatedAt: updated.map { Date(timeIntervalSince1970: $0) },
             state: "open",
-            authorLogin: author
+            authorLogin: author,
+            isDraft: draft
         )
     }
 
@@ -305,6 +307,82 @@ final class PRSectioningTests: XCTestCase {
         XCTAssertEqual(sections.needsReview.map(\.number), [1])
     }
 
+    // MARK: - Draft PRs
+
+    func testDraftsHiddenFromNeedsReviewByDefault() {
+        let sections = PRSectioning.sections(
+            needsReviewRaw: [pr("watched/repo", 1, draft: true), pr("watched/repo", 2)],
+            reviewedByRaw: [],
+            authoredRaw: [],
+            whitelist: ["watched/repo"],
+            ignoreWhitelistForOwnPRs: false,
+            showDraftPRs: false
+        )
+        XCTAssertEqual(sections.needsReview.map(\.number), [2])
+    }
+
+    func testDraftsHiddenFromAlreadyReviewedByDefault() {
+        let sections = PRSectioning.sections(
+            needsReviewRaw: [],
+            reviewedByRaw: [pr("watched/repo", 1, draft: true), pr("watched/repo", 2)],
+            authoredRaw: [],
+            whitelist: ["watched/repo"],
+            ignoreWhitelistForOwnPRs: false,
+            showDraftPRs: false
+        )
+        XCTAssertEqual(sections.alreadyReviewed.map(\.number), [2])
+    }
+
+    func testShowDraftPRsRevealsThemInBothReviewSections() {
+        let sections = PRSectioning.sections(
+            needsReviewRaw: [pr("watched/repo", 1, draft: true)],
+            reviewedByRaw: [pr("watched/repo", 2, draft: true)],
+            authoredRaw: [],
+            whitelist: ["watched/repo"],
+            ignoreWhitelistForOwnPRs: false,
+            showDraftPRs: true
+        )
+        XCTAssertEqual(sections.needsReview.map(\.number), [1])
+        XCTAssertEqual(sections.alreadyReviewed.map(\.number), [2])
+    }
+
+    /// The draft filter is only about the two review sections; "My Open PRs"
+    /// always shows your own drafts regardless of the setting.
+    func testDraftFilterDoesNotAffectMyOpenPRs() {
+        let sections = PRSectioning.sections(
+            needsReviewRaw: [],
+            reviewedByRaw: [],
+            authoredRaw: [pr("watched/repo", 1, draft: true)],
+            whitelist: ["watched/repo"],
+            ignoreWhitelistForOwnPRs: false,
+            showDraftPRs: false
+        )
+        XCTAssertEqual(sections.myOpenPRs.map(\.number), [1])
+    }
+
+    func testDraftHiddenFromNeedsReviewIsExcludedFromBadgeCount() {
+        let sections = PRSectioning.sections(
+            needsReviewRaw: [pr("watched/repo", 1, draft: true), pr("watched/repo", 2)],
+            reviewedByRaw: [],
+            authoredRaw: [],
+            whitelist: ["watched/repo"],
+            ignoreWhitelistForOwnPRs: false,
+            showDraftPRs: false
+        )
+        XCTAssertEqual(sections.badgeCount, 1)
+    }
+
+    func testReviewedCandidatesHidesDraftsWhenDisabled() {
+        let candidates = PRSectioning.reviewedCandidates(
+            needsReviewRaw: [],
+            reviewedByRaw: [pr("watched/repo", 1, draft: true), pr("watched/repo", 2)],
+            authoredRaw: [],
+            whitelist: ["watched/repo"],
+            showDraftPRs: false
+        )
+        XCTAssertEqual(candidates.map(\.number), [2])
+    }
+
     // MARK: - Badge
 
     func testBadgeCountsOnlyNeedsReview() {
@@ -562,5 +640,21 @@ final class SettingsStoreIgnoredAuthorsTests: XCTestCase {
         store.addAuthor("alice")
         store.removeAuthors(["dependabot[bot]"])
         XCTAssertEqual(store.ignoredAuthors, ["alice"])
+    }
+
+    // MARK: - showDraftPRs
+
+    func testShowDraftPRsDefaultsToFalse() {
+        let store = SettingsStore(defaults: freshDefaults())
+        XCTAssertFalse(store.showDraftPRs)
+    }
+
+    func testShowDraftPRsPersistsAcrossReload() {
+        let defaults = freshDefaults()
+        let store = SettingsStore(defaults: defaults)
+        store.showDraftPRs = true
+
+        let reloaded = SettingsStore(defaults: defaults)
+        XCTAssertTrue(reloaded.showDraftPRs)
     }
 }

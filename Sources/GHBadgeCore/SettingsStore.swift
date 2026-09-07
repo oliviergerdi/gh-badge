@@ -27,6 +27,7 @@ public final class SettingsStore: ObservableObject {
         public static let ignoreOlderThanValue = "ignoreOlderThanValue"
         public static let ignoreOlderThanUnit = "ignoreOlderThanUnit"
         public static let ignoredAuthors = "ignoredAuthors"
+        public static let showDraftPRs = "showDraftPRs"
     }
 
     public static let refreshIntervalOptions = [60, 120, 300, 600]
@@ -98,6 +99,13 @@ public final class SettingsStore: ObservableObject {
         didSet { persist(refreshIntervalSeconds, Key.refreshIntervalSeconds) }
     }
 
+    /// Show draft PRs in the review sections. Off by default: drafts are
+    /// hidden from "Needs My Review" and "Already Reviewed, Still Open" until
+    /// the user opts in. Doesn't affect "My Open PRs".
+    @Published public var showDraftPRs: Bool = false {
+        didSet { persist(showDraftPRs, Key.showDraftPRs) }
+    }
+
     public init(defaults: UserDefaults = .standard) {
         self.defaults = defaults
         load()
@@ -120,6 +128,7 @@ public final class SettingsStore: ObservableObject {
         ignoreOlderThanUnitRaw = defaults.string(forKey: Key.ignoreOlderThanUnit)
             ?? StalenessUnit.days.rawValue
         ignoredAuthors = defaults.stringArray(forKey: Key.ignoredAuthors) ?? Self.defaultIgnoredAuthors
+        showDraftPRs = defaults.bool(forKey: Key.showDraftPRs)
         isLoading = false
     }
 

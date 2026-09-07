@@ -153,6 +153,46 @@ final class PullRequestDecodingTests: XCTestCase {
         XCTAssertEqual(decoded.first?.authorLogin, "dependabot[bot]")
     }
 
+    // MARK: - isDraft
+
+    func testDecodesIsDraftTrue() throws {
+        let json = """
+        [{
+          "number": 1,
+          "repository": { "nameWithOwner": "a/b" },
+          "url": "https://github.com/a/b/pull/1",
+          "isDraft": true
+        }]
+        """
+        XCTAssertTrue(try decode(json)[0].isDraft)
+    }
+
+    /// Fixtures (and any real payload predating this field) omit `isDraft`
+    /// entirely; decoding must default to `false`, not throw.
+    func testMissingIsDraftDefaultsToFalse() throws {
+        let json = """
+        [{
+          "number": 1,
+          "repository": { "nameWithOwner": "a/b" },
+          "url": "https://github.com/a/b/pull/1"
+        }]
+        """
+        XCTAssertFalse(try decode(json)[0].isDraft)
+    }
+
+    func testIsDraftRoundTripsThroughEncoding() throws {
+        let original = PullRequest(
+            repo: "a/b",
+            number: 5,
+            title: "Round trip",
+            url: "https://github.com/a/b/pull/5",
+            isDraft: true
+        )
+        let data = try JSONEncoder().encode([original])
+        let decoded = try JSONDecoder().decode([PullRequest].self, from: data)
+        XCTAssertEqual(decoded.first?.isDraft, true)
+    }
+
     // MARK: - stderr condensing
 
     func testCondenseDropsUpdateNotifierNoise() {

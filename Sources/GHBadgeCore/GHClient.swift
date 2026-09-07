@@ -305,7 +305,7 @@ public actor GHClient {
     // MARK: - Queries
 
     /// Fields confirmed available from `gh search prs --help` (JSON FIELDS).
-    private static let jsonFields = "repository,number,title,url,updatedAt,state,author"
+    private static let jsonFields = "repository,number,title,url,updatedAt,state,author,isDraft"
 
     /// Runs `gh search prs <filters> --state=open --json <fields>`.
     ///
