@@ -129,6 +129,16 @@ public final class PRStore: ObservableObject {
                 self?.recomputeSections()
             }
             .store(in: &cancellables)
+
+        // Same reasoning again: `isDraft` is decoded alongside the rest of
+        // each PR, so toggling this is a pure display filter with no need to
+        // re-hit the API.
+        settings.$showDraftPRs
+            .dropFirst()
+            .sink { [weak self] _ in
+                self?.recomputeSections()
+            }
+            .store(in: &cancellables)
     }
 
     // MARK: - Refresh
@@ -214,7 +224,8 @@ public final class PRStore: ObservableObject {
             authoredRaw: resolvedAuthored,
             whitelist: settings.repoWhitelist,
             ignoreOlderThan: settings.ignoreOlderThanCutoff,
-            ignoredAuthors: settings.ignoredAuthors
+            ignoredAuthors: settings.ignoredAuthors,
+            showDraftPRs: settings.showDraftPRs
         )
         lastStaleReviewURLs = await ghClient.staleReviewURLs(for: reviewedCandidates)
 
@@ -251,6 +262,7 @@ public final class PRStore: ObservableObject {
             ignoreWhitelistForOwnPRs: settings.ignoreWhitelistForOwnPRs,
             ignoreOlderThan: settings.ignoreOlderThanCutoff,
             ignoredAuthors: settings.ignoredAuthors,
+            showDraftPRs: settings.showDraftPRs,
             staleReviewURLs: lastStaleReviewURLs
         )
     }

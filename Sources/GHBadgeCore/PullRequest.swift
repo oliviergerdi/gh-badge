@@ -23,6 +23,10 @@ public struct PullRequest: Identifiable, Hashable, Codable, Sendable {
     /// fabricate a value in that case.
     public let authorLogin: String?
 
+    /// Whether the PR is a draft. Defaults to `false` so fixtures and any
+    /// payload predating this field decode as a normal, non-draft PR.
+    public let isDraft: Bool
+
     public init(
         repo: String,
         number: Int,
@@ -30,7 +34,8 @@ public struct PullRequest: Identifiable, Hashable, Codable, Sendable {
         url: String,
         updatedAt: Date? = nil,
         state: String = "open",
-        authorLogin: String? = nil
+        authorLogin: String? = nil,
+        isDraft: Bool = false
     ) {
         self.repo = repo
         self.number = number
@@ -39,6 +44,7 @@ public struct PullRequest: Identifiable, Hashable, Codable, Sendable {
         self.updatedAt = updatedAt
         self.state = state
         self.authorLogin = authorLogin
+        self.isDraft = isDraft
     }
 
     /// Just the repository name, without the owner. Used in the dropdown, where
@@ -55,7 +61,7 @@ public struct PullRequest: Identifiable, Hashable, Codable, Sendable {
     // MARK: - Decoding
 
     private enum CodingKeys: String, CodingKey {
-        case repository, number, title, url, updatedAt, state, author
+        case repository, number, title, url, updatedAt, state, author, isDraft
     }
 
     public init(from decoder: Decoder) throws {
@@ -71,6 +77,8 @@ public struct PullRequest: Identifiable, Hashable, Codable, Sendable {
 
         self.updatedAt = try c.decodeIfPresent(String.self, forKey: .updatedAt)
             .flatMap(PullRequest.parseTimestamp)
+
+        self.isDraft = try c.decodeIfPresent(Bool.self, forKey: .isDraft) ?? false
 
         // `try?`, not `decodeIfPresent`: an `author` key whose value is present
         // but missing `login` (or a shape we don't expect) should degrade to
@@ -90,6 +98,7 @@ public struct PullRequest: Identifiable, Hashable, Codable, Sendable {
         try c.encode(title, forKey: .title)
         try c.encode(url, forKey: .url)
         try c.encode(state, forKey: .state)
+        try c.encode(isDraft, forKey: .isDraft)
         if let updatedAt {
             try c.encode(PullRequest.formatTimestamp(updatedAt), forKey: .updatedAt)
         }

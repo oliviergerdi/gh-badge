@@ -36,6 +36,9 @@ public enum PRSectioning {
     ///   - ignoredAuthors: logins to hide from the review sections only (e.g.
     ///     "dependabot[bot]"); `myOpenPRs` is always PRs you authored, so this
     ///     list has nothing to say about it.
+    ///   - showDraftPRs: when false, draft PRs are hidden from `needsReview`
+    ///     and `alreadyReviewed` only; `myOpenPRs` always shows your own
+    ///     drafts.
     ///   - staleReviewURLs: URLs (from `reviewedCandidates`) with new commits
     ///     pushed since the viewer's last review. Functionally a fresh review
     ///     request, so these move into `needsReview` (and the badge) instead
@@ -48,18 +51,21 @@ public enum PRSectioning {
         ignoreWhitelistForOwnPRs: Bool,
         ignoreOlderThan cutoff: Date? = nil,
         ignoredAuthors: [String] = [],
+        showDraftPRs: Bool = true,
         staleReviewURLs: Set<String> = []
     ) -> PRSections {
         let permitted = permittedPredicate(whitelist)
         let recent = recentPredicate(cutoff)
         let notIgnored = notIgnoredPredicate(ignoredAuthors)
+        let notHiddenDraft = draftPredicate(showDraftPRs)
 
         let baseNeeds = baseNeedsReview(
             needsReviewRaw: needsReviewRaw,
             authoredRaw: authoredRaw,
             permitted: permitted,
             recent: recent,
-            notIgnored: notIgnored
+            notIgnored: notIgnored,
+            notHiddenDraft: notHiddenDraft
         )
 
         let candidates = reviewedCandidates(
@@ -68,7 +74,8 @@ public enum PRSectioning {
             authoredRaw: authoredRaw,
             whitelist: whitelist,
             ignoreOlderThan: cutoff,
-            ignoredAuthors: ignoredAuthors
+            ignoredAuthors: ignoredAuthors,
+            showDraftPRs: showDraftPRs
         )
 
         let staleReviewed = candidates.filter { staleReviewURLs.contains($0.url) }
@@ -100,25 +107,31 @@ public enum PRSectioning {
         authoredRaw: [PullRequest],
         whitelist: [String],
         ignoreOlderThan cutoff: Date? = nil,
-        ignoredAuthors: [String] = []
+        ignoredAuthors: [String] = [],
+        showDraftPRs: Bool = true
     ) -> [PullRequest] {
         let permitted = permittedPredicate(whitelist)
         let recent = recentPredicate(cutoff)
         let notIgnored = notIgnoredPredicate(ignoredAuthors)
+        let notHiddenDraft = draftPredicate(showDraftPRs)
 
         let needsReview = baseNeedsReview(
             needsReviewRaw: needsReviewRaw,
             authoredRaw: authoredRaw,
             permitted: permitted,
             recent: recent,
-            notIgnored: notIgnored
+            notIgnored: notIgnored,
+            notHiddenDraft: notHiddenDraft
         )
         // A re-requested review wins: if a PR appears in both, it belongs only
         // in section 1.
         let needsReviewURLs = Set(needsReview.map(\.url))
 
         return dedupe(reviewedByRaw)
-            .filter { permitted($0) && !needsReviewURLs.contains($0.url) && recent($0) && notIgnored($0) }
+            .filter {
+                permitted($0) && !needsReviewURLs.contains($0.url) && recent($0) && notIgnored($0)
+                    && notHiddenDraft($0)
+            }
     }
 
     // MARK: - Shared filter rules
@@ -147,6 +160,12 @@ public enum PRSectioning {
         }
     }
 
+    /// No "missing data" ambiguity here (unlike staleness/author): `isDraft`
+    /// always decodes to a concrete `Bool`, defaulting to `false` when absent.
+    private static func draftPredicate(_ showDraftPRs: Bool) -> (PullRequest) -> Bool {
+        { showDraftPRs || !$0.isDraft }
+    }
+
     /// You can't review your own PR, so an authored PR never belongs in
     /// "needs review" even when a team you're in was requested.
     private static func baseNeedsReview(
@@ -154,11 +173,15 @@ public enum PRSectioning {
         authoredRaw: [PullRequest],
         permitted: (PullRequest) -> Bool,
         recent: (PullRequest) -> Bool,
-        notIgnored: (PullRequest) -> Bool
+        notIgnored: (PullRequest) -> Bool,
+        notHiddenDraft: (PullRequest) -> Bool
     ) -> [PullRequest] {
         let authoredURLs = Set(dedupe(authoredRaw).map(\.url))
         return dedupe(needsReviewRaw)
-            .filter { permitted($0) && !authoredURLs.contains($0.url) && recent($0) && notIgnored($0) }
+            .filter {
+                permitted($0) && !authoredURLs.contains($0.url) && recent($0) && notIgnored($0)
+                    && notHiddenDraft($0)
+            }
     }
 
     /// De-duplicates by URL, keeping first occurrence. Needed because the user

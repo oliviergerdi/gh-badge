@@ -66,6 +66,16 @@ struct SettingsView: View {
             }
 
             Section {
+                Toggle("Show draft pull requests", isOn: $settings.showDraftPRs)
+            } header: {
+                Text("Drafts")
+            } footer: {
+                Text("Off by default. Hides draft PRs from Needs My Review and Already Reviewed, Still Open. Doesn't affect My Open PRs.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+
+            Section {
                 Toggle("Ignore PRs older than", isOn: $settings.ignoreOlderThanEnabled)
 
                 if settings.ignoreOlderThanEnabled {
