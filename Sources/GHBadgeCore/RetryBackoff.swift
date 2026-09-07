@@ -1,7 +1,7 @@
 import Foundation
 
 /// Pure backoff-delay math for retrying `gh` calls, deliberately separated out
-/// (same reasoning as `PRSectioning`/`StaleReviewQuery`) so it's testable
+/// (same reasoning as `PRSectioning`/`PRRevisionQuery`) so it's testable
 /// without a main actor, a network, or a `gh` binary.
 ///
 /// Two distinct problems, two policies:

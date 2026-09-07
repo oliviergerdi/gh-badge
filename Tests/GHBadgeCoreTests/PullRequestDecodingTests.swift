@@ -212,14 +212,14 @@ final class PullRequestDecodingTests: XCTestCase {
         XCTAssertEqual(GHClient.condense(stderr), "error connecting to api.github.com")
     }
 
-    // MARK: - StaleReviewQuery.build
+    // MARK: - PRRevisionQuery.build
 
     func testBuildOneAliasPerPR() {
         let prs = [
             PullRequest(repo: "a/b", number: 1, title: "x", url: "u1"),
             PullRequest(repo: "c/d", number: 2, title: "y", url: "u2"),
         ]
-        let query = StaleReviewQuery.build(for: prs)
+        let query = PRRevisionQuery.build(for: prs)
         XCTAssertTrue(query.contains(#"r0: repository(owner: "a", name: "b")"#))
         XCTAssertTrue(query.contains("pullRequest(number: 1)"))
         XCTAssertTrue(query.contains(#"r1: repository(owner: "c", name: "d")"#))
@@ -228,11 +228,19 @@ final class PullRequestDecodingTests: XCTestCase {
 
     func testBuildEscapesQuotesInRepoName() {
         let prs = [PullRequest(repo: #"a"b/c"#, number: 1, title: "x", url: "u1")]
-        let query = StaleReviewQuery.build(for: prs)
+        let query = PRRevisionQuery.build(for: prs)
         XCTAssertTrue(query.contains(#"owner: "a\"b""#))
     }
 
-    // MARK: - StaleReviewQuery.parse (batched GraphQL)
+    /// Requested unconditionally: it's one more scalar field on a node the
+    /// query already visits, so `showBranchName` costs nothing extra to
+    /// support once the staleness check is already running.
+    func testBuildAlwaysRequestsHeadRefName() {
+        let prs = [PullRequest(repo: "a/b", number: 1, title: "x", url: "u1")]
+        XCTAssertTrue(PRRevisionQuery.build(for: prs).contains("headRefName"))
+    }
+
+    // MARK: - PRRevisionQuery.parse (batched GraphQL)
 
     func testParseFlagsPRWhoseHeadMovedPastTheReview() throws {
         let pr = PullRequest(repo: "a/b", number: 1, title: "x", url: "https://github.com/a/b/pull/1")
@@ -242,8 +250,8 @@ final class PullRequestDecodingTests: XCTestCase {
           "viewerLatestReview": { "commit": { "oid": "old-commit" } }
         }}}}
         """
-        let stale = StaleReviewQuery.parse(Data(json.utf8), prs: [pr])
-        XCTAssertEqual(stale, [pr.url])
+        let info = PRRevisionQuery.parse(Data(json.utf8), prs: [pr])
+        XCTAssertEqual(info.staleReviewURLs, [pr.url])
     }
 
     func testParseDoesNotFlagPRAtTheReviewedCommit() throws {
@@ -254,7 +262,7 @@ final class PullRequestDecodingTests: XCTestCase {
           "viewerLatestReview": { "commit": { "oid": "same-commit" } }
         }}}}
         """
-        XCTAssertTrue(StaleReviewQuery.parse(Data(json.utf8), prs: [pr]).isEmpty)
+        XCTAssertTrue(PRRevisionQuery.parse(Data(json.utf8), prs: [pr]).staleReviewURLs.isEmpty)
     }
 
     /// No review from the viewer at all (e.g. a token/viewer mismatch) can't be
@@ -267,7 +275,7 @@ final class PullRequestDecodingTests: XCTestCase {
           "viewerLatestReview": null
         }}}}
         """
-        XCTAssertTrue(StaleReviewQuery.parse(Data(json.utf8), prs: [pr]).isEmpty)
+        XCTAssertTrue(PRRevisionQuery.parse(Data(json.utf8), prs: [pr]).staleReviewURLs.isEmpty)
     }
 
     func testParseIsPositionalAcrossMultiplePRs() throws {
@@ -279,16 +287,48 @@ final class PullRequestDecodingTests: XCTestCase {
           "r1":{"pullRequest":{"headRefOid":"same","viewerLatestReview":{"commit":{"oid":"same"}}}}
         }}
         """
-        let stale = StaleReviewQuery.parse(Data(json.utf8), prs: [staleOne, freshOne])
-        XCTAssertEqual(stale, [staleOne.url])
+        let info = PRRevisionQuery.parse(Data(json.utf8), prs: [staleOne, freshOne])
+        XCTAssertEqual(info.staleReviewURLs, [staleOne.url])
     }
 
     func testParseToleratesTotallyMalformedResponse() {
         let pr = PullRequest(repo: "a/b", number: 1, title: "x", url: "https://github.com/a/b/pull/1")
-        XCTAssertTrue(StaleReviewQuery.parse(Data("not json".utf8), prs: [pr]).isEmpty)
+        let info = PRRevisionQuery.parse(Data("not json".utf8), prs: [pr])
+        XCTAssertTrue(info.staleReviewURLs.isEmpty)
+        XCTAssertTrue(info.branchNames.isEmpty)
     }
 
-    // MARK: - StaleReviewQuery.parsePerPRView (fallback path)
+    // MARK: - PRRevisionQuery.parse — branch names
+
+    func testParseExtractsBranchName() {
+        let pr = PullRequest(repo: "a/b", number: 1, title: "x", url: "https://github.com/a/b/pull/1")
+        let json = """
+        {"data":{"r0":{"pullRequest":{
+          "headRefOid": "c1",
+          "headRefName": "feature/widgets",
+          "viewerLatestReview": null
+        }}}}
+        """
+        let info = PRRevisionQuery.parse(Data(json.utf8), prs: [pr])
+        XCTAssertEqual(info.branchNames[pr.url], "feature/widgets")
+    }
+
+    /// A missing `headRefName` just means no branch name for that PR — not a
+    /// reason to also drop its staleness result.
+    func testParseMissingBranchNameLeavesStalenessUnaffected() {
+        let pr = PullRequest(repo: "a/b", number: 1, title: "x", url: "https://github.com/a/b/pull/1")
+        let json = """
+        {"data":{"r0":{"pullRequest":{
+          "headRefOid": "new-commit",
+          "viewerLatestReview": { "commit": { "oid": "old-commit" } }
+        }}}}
+        """
+        let info = PRRevisionQuery.parse(Data(json.utf8), prs: [pr])
+        XCTAssertEqual(info.staleReviewURLs, [pr.url])
+        XCTAssertNil(info.branchNames[pr.url])
+    }
+
+    // MARK: - PRRevisionQuery.parsePerPRView (fallback path)
 
     func testParsePerPRViewFlagsHeadPastMyLatestReview() {
         let pr = PullRequest(repo: "a/b", number: 1, title: "x", url: "https://github.com/a/b/pull/1")
@@ -300,7 +340,8 @@ final class PullRequestDecodingTests: XCTestCase {
           ]
         }
         """
-        XCTAssertEqual(StaleReviewQuery.parsePerPRView(Data(json.utf8), pr: pr, viewerLogin: "me"), pr.url)
+        let result = PRRevisionQuery.parsePerPRView(Data(json.utf8), pr: pr, viewerLogin: "me")
+        XCTAssertTrue(result.isStale)
     }
 
     func testParsePerPRViewPicksTheLatestOfMyMultipleReviews() {
@@ -314,7 +355,8 @@ final class PullRequestDecodingTests: XCTestCase {
           ]
         }
         """
-        XCTAssertNil(StaleReviewQuery.parsePerPRView(Data(json.utf8), pr: pr, viewerLogin: "me"))
+        let result = PRRevisionQuery.parsePerPRView(Data(json.utf8), pr: pr, viewerLogin: "me")
+        XCTAssertFalse(result.isStale)
     }
 
     func testParsePerPRViewIgnoresOtherReviewers() {
@@ -327,6 +369,23 @@ final class PullRequestDecodingTests: XCTestCase {
           ]
         }
         """
-        XCTAssertNil(StaleReviewQuery.parsePerPRView(Data(json.utf8), pr: pr, viewerLogin: "me"))
+        let result = PRRevisionQuery.parsePerPRView(Data(json.utf8), pr: pr, viewerLogin: "me")
+        XCTAssertFalse(result.isStale)
+    }
+
+    /// The fallback path reads `headRefName` too, independent of whether a
+    /// viewer review was found at all.
+    func testParsePerPRViewExtractsBranchNameEvenWithoutAMatchingReview() {
+        let pr = PullRequest(repo: "a/b", number: 1, title: "x", url: "https://github.com/a/b/pull/1")
+        let json = """
+        {
+          "headRefOid": "new-commit",
+          "headRefName": "fix/typo",
+          "reviews": []
+        }
+        """
+        let result = PRRevisionQuery.parsePerPRView(Data(json.utf8), pr: pr, viewerLogin: "me")
+        XCTAssertFalse(result.isStale)
+        XCTAssertEqual(result.branchName, "fix/typo")
     }
 }

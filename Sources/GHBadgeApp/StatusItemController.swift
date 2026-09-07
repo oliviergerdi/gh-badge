@@ -1,6 +1,7 @@
 import AppKit
 import Combine
 import GHBadgeCore
+import QuartzCore
 import SwiftUI
 
 /// Owns the menu bar item and its two interactions: a left click toggles the
@@ -29,7 +30,18 @@ final class StatusItemController {
 
     private var cancellables = Set<AnyCancellable>()
 
-    init(store: PRStore, settings: SettingsStore, onOpenSettings: @escaping () -> Void) {
+    /// URLs in "Needs My Review" as of the last icon update. `nil` until the
+    /// first update, which deliberately suppresses the new-PR flash on launch
+    /// — everything looks "new" the first time the list populates, and that's
+    /// not a meaningful event worth flashing over.
+    private var previousNeedsReviewURLs: Set<String>?
+
+    /// Clears the temporary "N New" title. Re-created (and the old one
+    /// cancelled) on every flash so a fresh arrival during an existing flash
+    /// restarts the 5-second window instead of being cut short by the first.
+    private var clearFlashTitle: DispatchWorkItem?
+
+    init(store: PRStore, settings: SettingsStore, seen: SeenPRStore, onOpenSettings: @escaping () -> Void) {
         self.store = store
         self.onOpenSettings = onOpenSettings
 
@@ -43,6 +55,7 @@ final class StatusItemController {
             rootView: DropdownView(
                 store: store,
                 settings: settings,
+                seen: seen,
                 onOpenSettings: onOpenSettings
             )
         )
@@ -82,7 +95,62 @@ final class StatusItemController {
             count: store.badgeCount,
             isError: store.ghError != nil
         )
+        checkForNewlyArrivedPRs()
     }
+
+    /// Flashes the icon when a PR appears in "Needs My Review" that wasn't
+    /// there on the previous update — the moment worth interrupting for is a
+    /// PR actually landing, not the count merely changing (toggling a filter
+    /// like "show drafts" can change the count without anything new arriving).
+    private func checkForNewlyArrivedPRs() {
+        let currentURLs = Set(store.sections.needsReview.map(\.url))
+        defer { previousNeedsReviewURLs = currentURLs }
+
+        guard store.ghError == nil, let previousURLs = previousNeedsReviewURLs else { return }
+        let arrived = currentURLs.subtracting(previousURLs)
+        guard !arrived.isEmpty else { return }
+
+        flash()
+    }
+
+    /// Pulses the icon and shows a temporary "NEW" title next to it — no
+    /// count in the title, since the badge already shows the number and a
+    /// second, different count right next to it just looked confusing. The
+    /// title disappears the moment the pulse finishes rather than lingering
+    /// past it. There's no system API for "flash this status item" (that's
+    /// Dock-icon-only via `NSApplication.requestUserAttention`), so both
+    /// effects are hand-rolled.
+    private func flash() {
+        guard let button = statusItem.button else { return }
+
+        clearFlashTitle?.cancel()
+
+        button.wantsLayer = true
+        button.layer?.removeAnimation(forKey: Self.pulseAnimationKey)
+        let pulse = CABasicAnimation(keyPath: "opacity")
+        pulse.fromValue = 1.0
+        pulse.toValue = 0.2
+        pulse.duration = Self.pulseHalfCycleDuration
+        pulse.autoreverses = true
+        pulse.repeatCount = Self.pulseRepeatCount
+        pulse.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
+        button.layer?.add(pulse, forKey: Self.pulseAnimationKey)
+
+        button.imagePosition = .imageLeft
+        button.title = "NEW"
+
+        let clearTitle = DispatchWorkItem { [weak button] in
+            button?.title = ""
+        }
+        clearFlashTitle = clearTitle
+        DispatchQueue.main.asyncAfter(deadline: .now() + Self.pulseTotalDuration, execute: clearTitle)
+    }
+
+    private static let pulseAnimationKey = "gh-badge-new-pr-pulse"
+    private static let pulseHalfCycleDuration: TimeInterval = 0.35
+    private static let pulseRepeatCount: Float = 4
+    /// Autoreverses, so each repeat is a full there-and-back cycle.
+    private static let pulseTotalDuration = pulseHalfCycleDuration * TimeInterval(pulseRepeatCount) * 2
 
     // MARK: - Click handling
 

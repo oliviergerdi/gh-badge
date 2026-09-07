@@ -35,15 +35,33 @@ public enum GHError: LocalizedError, Equatable, Sendable {
     }
 }
 
-/// Pure query-building and response-parsing for the stale-review check,
-/// deliberately separated from `GHClient` so it's testable without spawning a
-/// process. "Stale" here means: the viewer reviewed this PR, and its head
-/// commit has since moved past the commit that review was submitted against.
-enum StaleReviewQuery {
+/// Result of a `PRRevisionQuery`: per-PR data `gh search prs` can't provide,
+/// fetched together in one call so a caller that wants either piece doesn't
+/// pay for a second round-trip to get the other. `public` because it's part
+/// of `GHClient.fetchRevisionInfo`'s public signature, same as `PullRequest`.
+public struct PRRevisionInfo: Equatable, Sendable {
+    /// URLs of PRs whose head commit has moved past the viewer's last review
+    /// on them.
+    public var staleReviewURLs: Set<String> = []
+    /// PR URL -> head branch name, for whichever PRs were included in the
+    /// query and had one.
+    public var branchNames: [String: String] = [:]
+}
+
+/// Pure query-building and response-parsing for per-PR data not available
+/// from `gh search prs`, deliberately separated from `GHClient` so it's
+/// testable without spawning a process. Covers two things in one query:
+///   - staleness: the viewer reviewed this PR, and its head commit has since
+///     moved past the commit that review was submitted against.
+///   - the PR's head branch name, for `showBranchName`.
+enum PRRevisionQuery {
     /// One aliased `repository` block per PR, so an arbitrary-length list of
     /// checks batches into a single GraphQL request instead of N round-trips.
     /// `viewerLatestReview` is a GraphQL convenience field scoped to the
     /// authenticated caller — no need to know or match the viewer's login.
+    /// `headRefName` is fetched unconditionally: it's one more scalar field on
+    /// a node this query already visits, so it costs nothing extra even on a
+    /// call whose caller only cares about staleness.
     static func build(for prs: [PullRequest]) -> String {
         let blocks = prs.enumerated().compactMap { index, pr -> String? in
             let parts = pr.repo.split(separator: "/", maxSplits: 1).map(String.init)
@@ -52,6 +70,7 @@ enum StaleReviewQuery {
             r\(index): repository(owner: "\(escape(parts[0]))", name: "\(escape(parts[1]))") {
               pullRequest(number: \(pr.number)) {
                 headRefOid
+                headRefName
                 viewerLatestReview { commit { oid } }
               }
             }
@@ -67,54 +86,68 @@ enum StaleReviewQuery {
     /// `prs` must be in the same order passed to `build(for:)`: the alias index
     /// (`r0`, `r1`, …) is positional, not carried in the response.
     ///
-    /// Any node that's missing, malformed, or lacks a review from the viewer is
-    /// treated as "not stale" — same "can't prove it, don't move it" rule used
-    /// elsewhere: a parsing gap should never wrongly yank a PR out of the
-    /// reviewed list.
-    static func parse(_ responseData: Data, prs: [PullRequest]) -> Set<String> {
+    /// A node that's missing or malformed simply contributes nothing for that
+    /// PR to either piece of data — same "can't prove it, don't move it" rule
+    /// used elsewhere: a parsing gap should never wrongly yank a PR out of the
+    /// reviewed list, and a missing branch name just means the row shows none.
+    static func parse(_ responseData: Data, prs: [PullRequest]) -> PRRevisionInfo {
         guard
             let root = try? JSONSerialization.jsonObject(with: responseData) as? [String: Any],
             let data = root["data"] as? [String: Any]
-        else { return [] }
+        else { return PRRevisionInfo() }
 
-        var stale = Set<String>()
+        var info = PRRevisionInfo()
         for (index, pr) in prs.enumerated() {
             guard
                 let repoNode = data["r\(index)"] as? [String: Any],
-                let prNode = repoNode["pullRequest"] as? [String: Any],
+                let prNode = repoNode["pullRequest"] as? [String: Any]
+            else { continue }
+
+            if let branchName = prNode["headRefName"] as? String {
+                info.branchNames[pr.url] = branchName
+            }
+
+            if
                 let headRefOid = prNode["headRefOid"] as? String,
                 let review = prNode["viewerLatestReview"] as? [String: Any],
                 let commit = review["commit"] as? [String: Any],
-                let reviewedOid = commit["oid"] as? String
-            else { continue }
-
-            if reviewedOid != headRefOid {
-                stale.insert(pr.url)
+                let reviewedOid = commit["oid"] as? String,
+                reviewedOid != headRefOid
+            {
+                info.staleReviewURLs.insert(pr.url)
             }
         }
-        return stale
+        return info
     }
 
-    /// Fallback parser for `gh pr view <n> --json headRefOid,reviews`: same
-    /// "stale = reviewed commit differs from current head" rule, but the
-    /// viewer's review has to be picked out by login (no `viewerLatestReview`
-    /// convenience field on this shape) — the most recent one by `submittedAt`.
-    static func parsePerPRView(_ data: Data, pr: PullRequest, viewerLogin: String) -> String? {
+    /// Fallback parser for `gh pr view <n> --json headRefOid,headRefName,reviews`:
+    /// same rules as `parse`, but the viewer's review has to be picked out by
+    /// login (no `viewerLatestReview` convenience field on this shape) — the
+    /// most recent one by `submittedAt`.
+    static func parsePerPRView(
+        _ data: Data,
+        pr: PullRequest,
+        viewerLogin: String
+    ) -> (isStale: Bool, branchName: String?) {
+        guard let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            return (false, nil)
+        }
+
+        let branchName = root["headRefName"] as? String
+
         guard
-            let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
             let headRefOid = root["headRefOid"] as? String,
             let reviews = root["reviews"] as? [[String: Any]]
-        else { return nil }
+        else { return (false, branchName) }
 
         let mine = reviews.filter { ($0["author"] as? [String: Any])?["login"] as? String == viewerLogin }
-        guard let latest = mine.max(by: { submittedDate($0) < submittedDate($1) }) else { return nil }
-
         guard
+            let latest = mine.max(by: { submittedDate($0) < submittedDate($1) }),
             let commit = latest["commit"] as? [String: Any],
             let reviewedOid = commit["oid"] as? String
-        else { return nil }
+        else { return (false, branchName) }
 
-        return reviewedOid != headRefOid ? pr.url : nil
+        return (reviewedOid != headRefOid, branchName)
     }
 
     private static func submittedDate(_ review: [String: Any]) -> Date {
@@ -362,30 +395,31 @@ public actor GHClient {
         }
     }
 
-    // MARK: - Stale reviews (new commits since the viewer's last review)
+    // MARK: - Revision info (stale reviews + branch names)
 
     /// For each PR in `candidates`, checks whether its head commit has moved
-    /// past the viewer's last review on it. Tries one batched GraphQL request
-    /// first; if that fails outright (transport error, bad exit, unreadable
-    /// response), falls back to one `gh pr view` per PR.
+    /// past the viewer's last review on it, and reads its head branch name.
+    /// Tries one batched GraphQL request first; if that fails outright
+    /// (transport error, bad exit, unreadable response), falls back to one
+    /// `gh pr view` per PR.
     ///
     /// Never throws: this is a display enhancement, not core functionality, so
     /// a total failure here should silently skip the enhancement rather than
     /// surface an error banner or block a refresh.
-    public func staleReviewURLs(for candidates: [PullRequest]) async -> Set<String> {
-        guard !candidates.isEmpty else { return [] }
-        if let viaGraphQL = await staleReviewURLsViaGraphQL(candidates) {
+    public func fetchRevisionInfo(for candidates: [PullRequest]) async -> PRRevisionInfo {
+        guard !candidates.isEmpty else { return PRRevisionInfo() }
+        if let viaGraphQL = await revisionInfoViaGraphQL(candidates) {
             return viaGraphQL
         }
-        log.info("stale-review GraphQL batch failed; falling back to per-PR gh pr view")
-        return await staleReviewURLsPerPR(candidates)
+        log.info("revision-info GraphQL batch failed; falling back to per-PR gh pr view")
+        return await revisionInfoPerPR(candidates)
     }
 
     /// nil means the batched call failed outright; the caller falls back to
-    /// per-PR calls rather than treating that as "nothing is stale".
-    private func staleReviewURLsViaGraphQL(_ candidates: [PullRequest]) async -> Set<String>? {
+    /// per-PR calls rather than treating that as "nothing is stale, no branches".
+    private func revisionInfoViaGraphQL(_ candidates: [PullRequest]) async -> PRRevisionInfo? {
         guard let path = try? await ghPath() else { return nil }
-        let query = StaleReviewQuery.build(for: candidates)
+        let query = PRRevisionQuery.build(for: candidates)
         do {
             let result = try await ProcessRunner.run(
                 executable: path,
@@ -394,49 +428,61 @@ public actor GHClient {
                 timeout: requestTimeout
             )
             guard result.exitCode == 0, !result.stdout.isEmpty else { return nil }
-            return StaleReviewQuery.parse(result.stdout, prs: candidates)
+            return PRRevisionQuery.parse(result.stdout, prs: candidates)
         } catch {
             return nil
         }
     }
 
-    private func staleReviewURLsPerPR(_ candidates: [PullRequest]) async -> Set<String> {
-        guard let path = try? await ghPath(), let login = cachedLogin else { return [] }
+    private func revisionInfoPerPR(_ candidates: [PullRequest]) async -> PRRevisionInfo {
+        guard let path = try? await ghPath(), let login = cachedLogin else { return PRRevisionInfo() }
         let env = environment()
         let timeout = requestTimeout
 
-        return await withTaskGroup(of: String?.self) { group in
+        return await withTaskGroup(of: (String, isStale: Bool, branchName: String?).self) { group in
             for pr in candidates {
                 group.addTask {
-                    await Self.staleReviewURLPerPR(path: path, pr: pr, login: login, environment: env, timeout: timeout)
+                    let result = await Self.revisionInfoForOnePR(
+                        path: path,
+                        pr: pr,
+                        login: login,
+                        environment: env,
+                        timeout: timeout
+                    )
+                    return (pr.url, result.isStale, result.branchName)
                 }
             }
-            var stale = Set<String>()
-            for await url in group {
-                if let url { stale.insert(url) }
+            var info = PRRevisionInfo()
+            for await (url, isStale, branchName) in group {
+                if isStale { info.staleReviewURLs.insert(url) }
+                if let branchName { info.branchNames[url] = branchName }
             }
-            return stale
+            return info
         }
     }
 
-    private static func staleReviewURLPerPR(
+    private static func revisionInfoForOnePR(
         path: String,
         pr: PullRequest,
         login: String,
         environment: [String: String],
         timeout: TimeInterval
-    ) async -> String? {
+    ) async -> (isStale: Bool, branchName: String?) {
         do {
             let result = try await ProcessRunner.run(
                 executable: path,
-                arguments: ["pr", "view", String(pr.number), "--repo", pr.repo, "--json", "headRefOid,reviews"],
+                arguments: [
+                    "pr", "view", String(pr.number),
+                    "--repo", pr.repo,
+                    "--json", "headRefOid,headRefName,reviews",
+                ],
                 environment: environment,
                 timeout: timeout
             )
-            guard result.exitCode == 0 else { return nil }
-            return StaleReviewQuery.parsePerPRView(result.stdout, pr: pr, viewerLogin: login)
+            guard result.exitCode == 0 else { return (false, nil) }
+            return PRRevisionQuery.parsePerPRView(result.stdout, pr: pr, viewerLogin: login)
         } catch {
-            return nil
+            return (false, nil)
         }
     }
 

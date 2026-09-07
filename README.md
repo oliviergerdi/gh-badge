@@ -33,6 +33,13 @@ Click it and you get three tidy lists:
   runtime, no account to sign up for.
 - **Light and dark, automatically.** The icon adapts to your menu bar like a
   good macOS citizen.
+- **Recovers on its own.** A network blip or a flaky `gh` call retries
+  automatically with backoff, instead of leaving a stale error up until the
+  next scheduled refresh or a manual click.
+- **Remembers what you've already looked at.** Open a PR and its row dims;
+  a new commit or comment on it brings it back to full brightness on its own.
+- **Flags what's new.** When a PR lands in Needs My Review, the icon pulses
+  and briefly shows "NEW" so you don't have to keep re-checking by hand.
 
 ## See it in action
 
@@ -58,14 +65,43 @@ cd gh-badge
 That's it. The badge appears in your menu bar. Flip on **Launch at login** in
 Settings and it'll be waiting for you every morning.
 
+## Updating
+
+There's no auto-update — gh-badge is a local build, not something distributed
+through an App Store or a package manager. To pick up the latest changes:
+
+1. Quit gh-badge — click the badge and hit **Quit** in the dropdown, or
+   right-click it for the same option in the context menu.
+2. Pull the latest source:
+   ```sh
+   cd gh-badge
+   git pull
+   ```
+3. Rebuild and reinstall:
+   ```sh
+   ./build.sh --install --run
+   ```
+
+`build.sh` overwrites the copy in `/Applications` and relaunches it, so your
+settings (they live in `UserDefaults`, not the app bundle) carry over untouched.
+
 ## Make it yours
 
 Everything is opt-in and adjustable in **Settings**:
 
 - **Watch only the repos you care about** — it starts quiet, you add what matters
+- **Teams** — include PRs requested from a whole team, not just you personally
+- **Show all of my own open PRs, ignoring the whitelist** — so My Open PRs
+  always reflects everything you have in flight, watched or not
+- **Ignored authors** — hide PRs from specific logins in the review sections
+  (`dependabot[bot]` is ignored by default; doesn't touch My Open PRs)
+- **Show draft pull requests** — off by default; drafts stay out of Needs My
+  Review and Already Reviewed until you opt in
+- **Show author name** on each PR line — free, since it's already fetched
+- **Show branch name** on each PR line — costs one extra GitHub API call per
+  refresh, only made while this is on
 - **Ignore PRs older than** an hour, a day, a week — hide the stale stuff
 - **Refresh every** 1, 2, 5, or 10 minutes
-- **Teams** — include PRs requested from a whole team
 - **Launch at login**
 
 ## The fine print

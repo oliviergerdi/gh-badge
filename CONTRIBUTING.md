@@ -48,6 +48,7 @@ Sources/
     SettingsStore.swift   persisted settings + the staleness model
     PRSectioning.swift    pure sectioning/filtering/sorting logic
     RetryBackoff.swift    pure backoff-delay math: the poll loop and per-job gh retries
+    SeenPRs.swift         "opened, nothing changed since" dimming logic + persisted store
     PRStore.swift         poll loop, caching, error state
   GHBadgeApp/     executable — the menu bar UI
     StatusItemController.swift  NSStatusItem: left-click popover, right-click menu
