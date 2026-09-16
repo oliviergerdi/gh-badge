@@ -72,7 +72,7 @@ final class StatusItemController {
         addMenuItem("Quit", symbol: "power", action: #selector(quit))
 
         if let button = statusItem.button {
-            button.image = MenuBarIcon.image(count: store.badgeCount, isError: store.ghError != nil)
+            button.image = MenuBarIcon.image(count: store.badgeCount, isError: showsErrorIcon)
             button.target = self
             button.action = #selector(handleClick)
             button.sendAction(on: [.leftMouseUp, .rightMouseUp])
@@ -80,7 +80,7 @@ final class StatusItemController {
 
         // Re-render the badge when the count or error state changes.
         store.$sections
-            .combineLatest(store.$ghError)
+            .combineLatest(store.$ghError, store.$rateLimitedUntil)
             .receive(on: DispatchQueue.main)
             .sink { [weak self] _ in
                 self?.updateIcon()
@@ -93,9 +93,18 @@ final class StatusItemController {
     private func updateIcon() {
         statusItem.button?.image = MenuBarIcon.image(
             count: store.badgeCount,
-            isError: store.ghError != nil
+            isError: showsErrorIcon
         )
         checkForNewlyArrivedPRs()
+    }
+
+    /// A rate limit is deliberately *not* an error icon. The count on display
+    /// is real data that simply stopped being refreshed for a few minutes, and
+    /// a warning glyph would read as "gh is broken" — sending the user off to
+    /// check their auth over something that resolves itself. The dropdown's
+    /// countdown banner is where the situation gets explained.
+    private var showsErrorIcon: Bool {
+        store.ghError != nil && !store.isRateLimited
     }
 
     /// Flashes the icon when a PR appears in "Needs My Review" that wasn't
@@ -106,7 +115,10 @@ final class StatusItemController {
         let currentURLs = Set(store.sections.needsReview.map(\.url))
         defer { previousNeedsReviewURLs = currentURLs }
 
-        guard store.ghError == nil, let previousURLs = previousNeedsReviewURLs else { return }
+        // During a cooldown the sections are last-good data being
+        // re-published, not a fresh arrival worth flashing the icon over.
+        guard store.ghError == nil, !store.isRateLimited,
+              let previousURLs = previousNeedsReviewURLs else { return }
         let arrived = currentURLs.subtracting(previousURLs)
         guard !arrived.isEmpty else { return }
 

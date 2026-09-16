@@ -62,4 +62,75 @@ public enum RetryBackoff {
     public static func jobRetryDelay(attempt: Int) -> TimeInterval {
         min(0.5 * pow(2, Double(max(attempt - 1, 0))), 2)
     }
+
+    // MARK: - Rate limiting
+
+    /// How long to stay quiet when GitHub refuses for rate limiting but tells
+    /// us nothing about when to come back — the common case for the *secondary*
+    /// limit, whose whole point is that there is no published window.
+    public static let rateLimitFallbackCooldown: TimeInterval = 60
+
+    /// Floor on a cooldown. A reset timestamp that has already passed (clock
+    /// skew, a stale header) must not translate into "retry immediately", which
+    /// is precisely the behaviour that trips the secondary limit again.
+    public static let minRateLimitCooldown: TimeInterval = 15
+
+    /// Ceiling on a cooldown. Even a primary limit resets within the hour, so a
+    /// longer wait can only be a bad timestamp; better to retry and be refused
+    /// once than to go dark for the rest of the day.
+    public static let maxRateLimitCooldown: TimeInterval = 3_600
+
+    /// When to resume requests after being rate limited.
+    ///
+    /// - Parameters:
+    ///   - resetAt: GitHub's own reset time, when it gave one.
+    ///   - consecutiveRateLimits: how many refusals in a row. Only used when
+    ///     `resetAt` is absent: with no guidance, each further refusal doubles
+    ///     the blind wait rather than re-probing on the same cadence that just
+    ///     failed.
+    public static func rateLimitCooldownEnd(
+        resetAt: Date?,
+        consecutiveRateLimits: Int = 1,
+        now: Date = Date()
+    ) -> Date {
+        let seconds: TimeInterval
+        if let resetAt {
+            seconds = resetAt.timeIntervalSince(now)
+        } else {
+            let exponent = min(max(consecutiveRateLimits - 1, 0), 6)
+            seconds = rateLimitFallbackCooldown * pow(2, Double(exponent))
+        }
+        let clamped = min(max(seconds, minRateLimitCooldown), maxRateLimitCooldown)
+        return now.addingTimeInterval(clamped)
+    }
+
+    /// The delay before the next poll when a rate-limit cooldown is in effect.
+    ///
+    /// Unlike `delay(failureCount:normalInterval:)` this is deliberately **not**
+    /// capped at `normalInterval`. That cap is right for a network blip — never
+    /// wait longer than the user's chosen cadence to recover — but wrong here:
+    /// polling every 60s through a limit that resets in 15 minutes just keeps
+    /// the limit alive. Waking a little *after* the reset, not before, is what
+    /// actually ends it.
+    public static func delayUntilCooldownEnd(_ end: Date, now: Date = Date()) -> TimeInterval {
+        max(end.timeIntervalSince(now), 1)
+    }
+
+    /// Spreads scheduled wake-ups so that several failing cycles — or several
+    /// copies of the app across a team, all polling on the same 5-minute
+    /// boundary — don't re-converge into a burst that reads as abuse.
+    ///
+    /// - Parameter randomUnit: a value in `0...1`. Injected so the maths is
+    ///   testable; production callers use the default.
+    public static func jittered(
+        _ delay: TimeInterval,
+        fraction: Double = 0.1,
+        randomUnit: Double = Double.random(in: 0...1)
+    ) -> TimeInterval {
+        guard delay > 0, fraction > 0 else { return delay }
+        let spread = delay * min(max(fraction, 0), 1)
+        // Jitter upward only. Subtracting could wake us before a reset time we
+        // were told to honour, which would waste the whole wait.
+        return delay + spread * min(max(randomUnit, 0), 1)
+    }
 }
