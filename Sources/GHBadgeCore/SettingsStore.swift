@@ -116,12 +116,13 @@ public final class SettingsStore: ObservableObject {
         didSet { persist(showAuthorName, Key.showAuthorName) }
     }
 
-    /// Show each PR's head branch name. Off by default: unlike author name,
-    /// this is *not* free. `gh search prs` has no branch field at all, so
-    /// showing it means widening the existing stale-review revision check
-    /// (`GHClient.fetchRevisionInfo`) to run over every currently-listed PR
-    /// instead of just "Already Reviewed" candidates — one extra `gh api
-    /// graphql` call per refresh, only when this is on.
+    /// Show each PR's head branch name. Off by default, though no longer for
+    /// cost reasons: the consolidated GraphQL fetch (`PRSearchQuery`) returns
+    /// `headRefName` on nodes it already walks, so on that path this is as free
+    /// as the author name. It still costs something on the REST fallback, where
+    /// `gh search prs` has no branch field and turning this on widens
+    /// `GHClient.fetchRevisionInfo` from "Already Reviewed" candidates to every
+    /// currently-listed PR.
     @Published public var showBranchName: Bool = false {
         didSet { persist(showBranchName, Key.showBranchName) }
     }

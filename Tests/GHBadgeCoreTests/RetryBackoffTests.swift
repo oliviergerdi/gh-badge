@@ -1,4 +1,5 @@
 import XCTest
+
 @testable import GHBadgeCore
 
 final class RetryBackoffTests: XCTestCase {

@@ -21,6 +21,25 @@ public final class PRStore: ObservableObject {
     /// acts.
     @Published public private(set) var needsUserAction = false
 
+    /// When the current GitHub rate-limit cooldown ends, or nil when there is
+    /// none. Published so the dropdown can count down against it; also the flag
+    /// that suppresses manual refresh, so a user clicking Refresh during a
+    /// cooldown can't deepen the very limit they are waiting out.
+    @Published public private(set) var rateLimitedUntil: Date?
+
+    /// True while the last refusal was GitHub's *secondary* (concurrency) limit
+    /// rather than the hourly budget. Only affects wording.
+    @Published public private(set) var rateLimitIsSecondary = false
+
+    /// Deliberately "a cooldown is recorded", not "the clock says it's still
+    /// running". The two differ for the gap between a cooldown elapsing and the
+    /// next refresh clearing it — and during that gap `ghError` still holds the
+    /// rate-limit message, so a time-based test would swap the countdown banner
+    /// for the generic one *with its Retry button*, the single affordance this
+    /// whole change exists to withhold. `refresh()` clears the flag the moment
+    /// the client's gate expires.
+    public var isRateLimited: Bool { rateLimitedUntil != nil }
+
     public var badgeCount: Int { sections.badgeCount }
 
     private let client: GHClient
@@ -79,10 +98,19 @@ public final class PRStore: ObservableObject {
                 guard let self else { return }
                 await self.refresh()
                 let normalInterval = TimeInterval(self.settings.refreshIntervalSeconds)
-                let delay = RetryBackoff.delay(
-                    failureCount: self.consecutiveFailureCount,
-                    normalInterval: normalInterval
-                )
+                // A rate-limit cooldown outranks both the normal cadence and
+                // the transient-failure backoff: it is the only one of the
+                // three where polling sooner actively prolongs the problem.
+                let base: TimeInterval
+                if let until = self.rateLimitedUntil, until > Date() {
+                    base = RetryBackoff.delayUntilCooldownEnd(until)
+                } else {
+                    base = RetryBackoff.delay(
+                        failureCount: self.consecutiveFailureCount,
+                        normalInterval: normalInterval
+                    )
+                }
+                let delay = RetryBackoff.jittered(base)
                 do {
                     try await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
                 } catch {
@@ -105,8 +133,10 @@ public final class PRStore: ObservableObject {
         // Anything that changes *what* we query should take effect promptly,
         // debounced so that typing in the whitelist editor is not one API call
         // per keystroke. `showBranchName` belongs here, not with the local
-        // display filters below: flipping it changes how wide the revision-info
-        // query is (see `refresh()`), so it needs a real re-fetch.
+        // display filters below: branch names are only kept in memory while it
+        // is on, so switching it on needs a real fetch to populate them. On the
+        // consolidated path that fetch is the same single request as always —
+        // the toggle no longer widens anything.
         let whitelistChanged = settings.$repoWhitelist.map { _ in () }
         let teamsChanged = settings.$teams.map { _ in () }
         let teamToggleChanged = settings.$teamReviewEnabled.map { _ in () }
@@ -165,8 +195,21 @@ public final class PRStore: ObservableObject {
 
     public func refresh() async {
         guard !isRefreshing else { return }
+        // Claimed before the first `await`. Any suspension point between the
+        // guard and this line lets a manual Refresh click and a poll tick both
+        // slip through and run a full refresh concurrently — doubling the
+        // request count, which is the very thing being fixed here.
         isRefreshing = true
         defer { isRefreshing = false }
+
+        // Refuse outright while a cooldown is running — including for a manual
+        // Refresh click. Every request made during a rate limit counts against
+        // it, so the one thing that must not happen is more traffic.
+        if let cooldown = await client.rateLimitState() {
+            applyRateLimit(until: cooldown.until, isSecondary: cooldown.isSecondary)
+            return
+        }
+        clearRateLimitState()
 
         if !didPreflight {
             do {
@@ -174,6 +217,9 @@ public final class PRStore: ObservableObject {
                 didPreflight = true
                 needsUserAction = false
                 ghError = nil
+            } catch let error as GHError where error.isRateLimited {
+                applyRateLimit(error)
+                return
             } catch let error as GHError {
                 apply(fatal: error)
                 return
@@ -198,7 +244,38 @@ public final class PRStore: ObservableObject {
             (whitelistEmpty && !settings.ignoreWhitelistForOwnPRs) ? [] : nil
 
         var firstError: GHError?
+        // Set when the consolidated GraphQL fetch supplied staleness and branch
+        // names inline, which makes the separate revision round-trip below
+        // unnecessary.
+        var inlineRevisionInfo: PRRevisionInfo?
 
+        let wantsAnySection = needsRaw == nil || reviewedRaw == nil || authoredRaw == nil
+
+        // Preferred path: one request for everything (see `PRSearchQuery`).
+        // Buckets this cycle doesn't need are still returned — they cost
+        // nothing extra, since the expense is the request, not the fields — and
+        // are simply discarded below.
+        if wantsAnySection {
+            do {
+                if let all = try await ghClient.fetchAll(login: login, teams: settings.activeTeams) {
+                    if needsRaw == nil { needsRaw = all.needsReview }
+                    if reviewedRaw == nil { reviewedRaw = all.reviewedBy }
+                    if authoredRaw == nil { authoredRaw = all.authored }
+                    inlineRevisionInfo = all.revisionInfo
+                }
+            } catch let error as GHError where error.isRateLimited {
+                applyRateLimit(error)
+                return
+            } catch let error as GHError {
+                firstError = error
+            } catch {
+                firstError = .commandFailed(detail: error.localizedDescription)
+            }
+        }
+
+        // Fallback: the old per-section REST searches, used only when the
+        // consolidated fetch could not be parsed or the `gh` in play doesn't
+        // support it.
         if needsRaw == nil {
             var jobs: [[String]] = [["--review-requested=\(login)"]]
             for team in settings.activeTeams {
@@ -224,6 +301,11 @@ public final class PRStore: ObservableObject {
             firstError = firstError ?? merged.error
         }
 
+        if let firstError, firstError.isRateLimited {
+            applyRateLimit(firstError)
+            return
+        }
+
         // Fall back to the previous good result for any section that failed.
         let resolvedNeeds = needsRaw ?? lastRawNeedsReview
         let resolvedReviewed = reviewedRaw ?? lastRawReviewedBy
@@ -233,51 +315,77 @@ public final class PRStore: ObservableObject {
         lastRawReviewedBy = resolvedReviewed
         lastRawAuthored = resolvedAuthored
 
-        // Extra signal `gh search prs` can't provide: for the PRs that would
-        // land in "Already Reviewed", check whether new commits have landed
-        // since the viewer's last review. Non-fatal by design (see
-        // `GHClient.fetchRevisionInfo`) — a failure here just skips this
-        // cycle's promotion/branch names, it never surfaces an error or
-        // blocks the rest of refresh.
-        let reviewedCandidates = PRSectioning.reviewedCandidates(
-            needsReviewRaw: resolvedNeeds,
-            reviewedByRaw: resolvedReviewed,
-            authoredRaw: resolvedAuthored,
-            whitelist: settings.repoWhitelist,
-            ignoreOlderThan: settings.ignoreOlderThanCutoff,
-            ignoredAuthors: settings.ignoredAuthors,
-            showDraftPRs: settings.showDraftPRs
-        )
-
-        // Branch names cost one extra `gh api graphql` call, so only when the
-        // setting is on do we widen the query from "Already Reviewed"
-        // candidates to every PR that will actually be visible — the same set
-        // `recomputeSections()` below will land on, computed here purely
-        // in-memory (no I/O) just to know what to ask for.
-        let revisionCandidates: [PullRequest]
-        if settings.showBranchName {
-            let preliminary = PRSectioning.sections(
+        // Extra signal plain search can't provide: for the PRs that would land
+        // in "Already Reviewed", whether new commits have arrived since the
+        // viewer's last review. Non-fatal by design — a failure here skips this
+        // cycle's promotions and branch names without surfacing an error or
+        // blocking the rest of refresh.
+        //
+        // nil means "couldn't look" (a cooldown, or every batch failing), which
+        // is *not* the same as "nothing is stale and no PR has a branch name".
+        // Overwriting the cache with an empty result would demote stale PRs out
+        // of Needs My Review and blank every branch name — the opposite of the
+        // "last-good data stays on screen" promise the cooldown banner makes.
+        let revisionInfo: PRRevisionInfo?
+        if let inlineRevisionInfo {
+            // Free: the consolidated query returned `headRefOid`,
+            // `headRefName` and `viewerLatestReview` on nodes it was already
+            // fetching, so there is nothing left to ask for. Note this makes
+            // `showBranchName` cost-free too — it no longer widens any query.
+            revisionInfo = inlineRevisionInfo
+        } else {
+            let reviewedCandidates = PRSectioning.reviewedCandidates(
                 needsReviewRaw: resolvedNeeds,
                 reviewedByRaw: resolvedReviewed,
                 authoredRaw: resolvedAuthored,
                 whitelist: settings.repoWhitelist,
-                ignoreWhitelistForOwnPRs: settings.ignoreWhitelistForOwnPRs,
                 ignoreOlderThan: settings.ignoreOlderThanCutoff,
                 ignoredAuthors: settings.ignoredAuthors,
                 showDraftPRs: settings.showDraftPRs
             )
-            revisionCandidates = PRSectioning.dedupe(
-                preliminary.needsReview + preliminary.alreadyReviewed + preliminary.myOpenPRs
-            )
-        } else {
-            revisionCandidates = reviewedCandidates
+
+            // Only on the fallback path does breadth still cost requests, so
+            // only here does `showBranchName` widen the candidate set from
+            // "Already Reviewed" to every PR that will actually be visible —
+            // computed purely in-memory (no I/O) just to know what to ask for.
+            let revisionCandidates: [PullRequest]
+            if settings.showBranchName {
+                let preliminary = PRSectioning.sections(
+                    needsReviewRaw: resolvedNeeds,
+                    reviewedByRaw: resolvedReviewed,
+                    authoredRaw: resolvedAuthored,
+                    whitelist: settings.repoWhitelist,
+                    ignoreWhitelistForOwnPRs: settings.ignoreWhitelistForOwnPRs,
+                    ignoreOlderThan: settings.ignoreOlderThanCutoff,
+                    ignoredAuthors: settings.ignoredAuthors,
+                    showDraftPRs: settings.showDraftPRs
+                )
+                revisionCandidates = PRSectioning.dedupe(
+                    preliminary.needsReview + preliminary.alreadyReviewed + preliminary.myOpenPRs
+                )
+            } else {
+                revisionCandidates = reviewedCandidates
+            }
+
+            revisionInfo = await ghClient.fetchRevisionInfo(for: revisionCandidates)
         }
 
-        let revisionInfo = await ghClient.fetchRevisionInfo(for: revisionCandidates)
-        lastStaleReviewURLs = revisionInfo.staleReviewURLs
-        branchNames = settings.showBranchName ? revisionInfo.branchNames : [:]
+        // Turning the setting off must clear the cache immediately, so this
+        // runs whether or not fresh data arrived.
+        if !settings.showBranchName { branchNames = [:] }
+        if let revisionInfo {
+            lastStaleReviewURLs = revisionInfo.staleReviewURLs
+            if settings.showBranchName { branchNames = revisionInfo.branchNames }
+        }
 
         recomputeSections()
+
+        // `fetchRevisionInfo` never throws, so a limit tripped inside it only
+        // shows up as client state. Pick it up before reporting success.
+        if let state = await ghClient.rateLimitState() {
+            applyRateLimit(until: state.until, isSecondary: state.isSecondary)
+            return
+        }
 
         if let firstError {
             if firstError.isFatalConfiguration {
@@ -298,9 +406,56 @@ public final class PRStore: ObservableObject {
         } else {
             ghError = nil
             needsUserAction = false
+            clearRateLimitState()
             lastUpdated = Date()
             consecutiveFailureCount = 0
         }
+    }
+
+    /// Leaves no trace of a finished cooldown.
+    ///
+    /// `rateLimitIsSecondary` is reset alongside the date so a later *primary*
+    /// limit can't be described with the leftover secondary-limit wording.
+    ///
+    /// `ghError` is cleared too, but only when it is still the rate-limit
+    /// message. Otherwise the refresh that follows — which can take a 20s
+    /// subprocess timeout — would run with `rateLimitedUntil == nil` and a
+    /// stale "GitHub rate limit reached." in `ghError`, so the dropdown would
+    /// fall through to the generic banner *with its Retry button* and the menu
+    /// bar would show the warning glyph. A genuine non-rate-limit error from an
+    /// earlier cycle is left alone to be overwritten or cleared as usual.
+    private func clearRateLimitState() {
+        if rateLimitedUntil != nil, ghError == Self.rateLimitMessage {
+            ghError = nil
+        }
+        rateLimitedUntil = nil
+        rateLimitIsSecondary = false
+    }
+
+    /// Single source for the banner text, so `applyRateLimit` and
+    /// `clearRateLimitState` can't drift apart on the comparison above.
+    private static let rateLimitMessage =
+        GHError.rateLimited(retryAt: .distantFuture, isSecondary: false).errorDescription
+
+    /// Enters the cooldown state: last-good data stays on screen, the banner
+    /// explains why nothing is updating, and the poll loop waits it out.
+    private func applyRateLimit(_ error: GHError) {
+        guard case .rateLimited(let retryAt, let isSecondary) = error else { return }
+        applyRateLimit(until: retryAt, isSecondary: isSecondary)
+    }
+
+    private func applyRateLimit(until: Date, isSecondary: Bool) {
+        rateLimitedUntil = until
+        rateLimitIsSecondary = isSecondary
+        ghError = Self.rateLimitMessage
+        // Not a configuration problem: there is nothing for the user to fix, so
+        // the fatal presentation (with its "install gh" affordance) is wrong.
+        needsUserAction = false
+        // Deliberately not fed into `consecutiveFailureCount`: that drives
+        // *faster* retries, which is the exact opposite of what a rate limit
+        // calls for. The cooldown end is the schedule now.
+        consecutiveFailureCount = 0
+        log.error("rate limited until \(until.description, privacy: .public)")
     }
 
     /// Rebuilds `sections` from the last good raw results and current settings.
@@ -366,6 +521,11 @@ public final class PRStore: ObservableObject {
     /// Fatal configuration errors (`gh` missing, not authenticated) are not
     /// retried here: every attempt would fail identically, and that class of
     /// error needs user action, not persistence.
+    ///
+    /// Neither is a rate limit, for the opposite reason — the retries would
+    /// *succeed* at reaching GitHub and each one would extend the block. Three
+    /// jobs × three attempts is nine extra requests aimed at a server that has
+    /// just said stop; bailing on the first refusal is the whole point.
     private static func searchPRsWithRetry(
         client: GHClient,
         filters: [String]
@@ -376,7 +536,7 @@ public final class PRStore: ObservableObject {
                 return .success(try await client.searchPRs(filters: filters))
             } catch let error as GHError {
                 lastError = error
-                if error.isFatalConfiguration { break }
+                if error.isFatalConfiguration || error.isRateLimited { break }
             } catch {
                 lastError = .commandFailed(detail: error.localizedDescription)
             }
@@ -404,7 +564,15 @@ public final class PRStore: ObservableObject {
                 anySuccess = true
                 collected.append(contentsOf: prs)
             case .failure(let error):
-                firstError = firstError ?? error
+                // A rate limit outranks whatever else came back: it changes
+                // what the caller does next (stop and wait) rather than just
+                // what the banner says, so it must not be hidden behind a
+                // sibling job's ordinary failure.
+                if error.isRateLimited {
+                    firstError = error
+                } else {
+                    firstError = firstError ?? error
+                }
             }
         }
 

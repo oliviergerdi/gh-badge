@@ -1,4 +1,5 @@
 import AppKit
+import Combine
 import GHBadgeCore
 import SwiftUI
 
@@ -15,7 +16,12 @@ struct DropdownView: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
-            if let error = store.ghError {
+            // A rate limit gets its own banner: the generic one offers a Retry
+            // button, and retrying is the one thing that must not happen here.
+            if let until = store.rateLimitedUntil {
+                RateLimitBanner(retryAt: until, isSecondary: store.rateLimitIsSecondary)
+                Divider()
+            } else if let error = store.ghError {
                 ErrorBanner(message: error, isFatal: store.needsUserAction) {
                     Task { await store.retryFromScratch() }
                 }
@@ -232,6 +238,73 @@ private struct PRRow: View {
 
 // MARK: - Banners
 
+/// Shown while GitHub has throttled us. Deliberately different from
+/// `ErrorBanner` in two ways:
+///
+///   - **No Retry button.** Every request made during a cooldown counts against
+///     it, so offering the user a button whose only effect is to prolong the
+///     wait would be actively misleading. `PRStore.refresh()` refuses during a
+///     cooldown regardless, but the UI shouldn't invite the attempt.
+///   - **A live countdown**, because "waiting" with no end in sight reads as a
+///     hang. The lists behind this banner still show the last good data.
+private struct RateLimitBanner: View {
+    let retryAt: Date
+    let isSecondary: Bool
+
+    @State private var now = Date()
+
+    /// One tick per second. `.common` mode so it keeps running while the
+    /// popover's scroll view is being dragged. `@State`, not `let`: a stored
+    /// property would build a fresh publisher on every parent re-render and
+    /// `onReceive` would resubscribe to it each time.
+    @State private var ticker = Timer.publish(every: 1, on: .main, in: .common).autoconnect()
+
+    var body: some View {
+        HStack(alignment: .top, spacing: 8) {
+            Image(systemName: "hourglass")
+                .foregroundStyle(.orange)
+            VStack(alignment: .leading, spacing: 3) {
+                Text(headline)
+                    .font(.system(size: 12))
+                    .fixedSize(horizontal: false, vertical: true)
+                Text(explanation)
+                    .font(.system(size: 11))
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            Spacer(minLength: 0)
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 9)
+        .background(Color.orange.opacity(0.10))
+        .onReceive(ticker) { now = $0 }
+    }
+
+    /// Once the clock runs out the countdown stops being the story: the app
+    /// resumes on its own at the next poll, which may be a moment away.
+    private var headline: String {
+        retryAt > now
+            ? "GitHub rate limit reached — resuming in \(countdown)"
+            : "GitHub rate limit reached — resuming shortly"
+    }
+
+    private var explanation: String {
+        isSecondary
+            ? "Too many requests at once. Showing the last successful update."
+            : "Hourly quota used up. Showing the last successful update."
+    }
+
+    private var countdown: String {
+        let remaining = Int(max(retryAt.timeIntervalSince(now), 0).rounded(.up))
+        if remaining >= 60 {
+            let minutes = remaining / 60
+            let seconds = remaining % 60
+            return seconds == 0 ? "\(minutes)m" : "\(minutes)m \(seconds)s"
+        }
+        return "\(remaining)s"
+    }
+}
+
 private struct ErrorBanner: View {
     let message: String
     let isFatal: Bool
@@ -317,7 +390,11 @@ private struct FooterBar: View {
                     Text("Refresh")
                 }
             }
-            .disabled(store.isRefreshing)
+            // Also disabled during a rate-limit cooldown: `PRStore.refresh()`
+            // refuses anyway, and a button that silently does nothing is worse
+            // than one that visibly can't be pressed.
+            .disabled(store.isRefreshing || store.isRateLimited)
+            .help(store.isRateLimited ? "Waiting out a GitHub rate limit" : "")
 
             Button("Settings…", action: onOpenSettings)
 
