@@ -12,7 +12,7 @@ struct DropdownView: View {
     private static let contentWidth: CGFloat = 460
     private static let listMaxHeight: CGFloat = 560
 
-    @State private var listContentHeight: CGFloat = DropdownView.listMaxHeight
+    @ViewState private var listContentHeight: CGFloat = DropdownView.listMaxHeight
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -165,7 +165,7 @@ private struct PRRow: View {
     /// Already resolved (and gated on `showBranchName`) by the caller — nil
     /// means either the setting is off or no branch name is known yet.
     let branchName: String?
-    @State private var isHovering = false
+    @ViewState private var isHovering = false
 
     /// Dimmed once you've opened it and nothing's changed since; the moment a
     /// refresh shows a newer `updatedAt`, this flips back on its own.
@@ -251,13 +251,13 @@ private struct RateLimitBanner: View {
     let retryAt: Date
     let isSecondary: Bool
 
-    @State private var now = Date()
+    @ViewState private var now = Date()
 
     /// One tick per second. `.common` mode so it keeps running while the
     /// popover's scroll view is being dragged. `@State`, not `let`: a stored
     /// property would build a fresh publisher on every parent re-render and
     /// `onReceive` would resubscribe to it each time.
-    @State private var ticker = Timer.publish(every: 1, on: .main, in: .common).autoconnect()
+    @ViewState private var ticker = Timer.publish(every: 1, on: .main, in: .common).autoconnect()
 
     var body: some View {
         HStack(alignment: .top, spacing: 8) {
