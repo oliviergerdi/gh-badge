@@ -154,9 +154,9 @@ private struct TokenListEditor: View {
     let onAdd: (String) -> Bool
     let onRemove: (Set<String>) -> Void
 
-    @State private var draft = ""
-    @State private var selection = Set<String>()
-    @State private var showInvalid = false
+    @ViewState private var draft = ""
+    @ViewState private var selection = Set<String>()
+    @ViewState private var showInvalid = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
